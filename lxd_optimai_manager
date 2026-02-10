@@ -16,6 +16,32 @@ fi
 # БЛОК 1: УСТАНОВКА И НАСТРОЙКА LXD
 # ============================================
 
+create_lxdbr0_network() {
+    local candidate_subnet
+
+    echo "→ Пробуем авто-конфигурацию сети..."
+    if lxc network create lxdbr0 ipv4.nat=true ipv6.address=none; then
+        return 0
+    fi
+
+    echo "⚠️ Авто-конфигурация не удалась. Пробуем фиксированные подсети..."
+    for candidate_subnet in \
+        "10.10.10.1/24" \
+        "10.20.20.1/24" \
+        "10.30.30.1/24" \
+        "10.40.40.1/24" \
+        "172.31.250.1/24" \
+        "192.168.250.1/24"; do
+        echo "→ Пробуем подсеть ${candidate_subnet}"
+        if lxc network create lxdbr0 ipv4.address="${candidate_subnet}" ipv4.nat=true ipv6.address=none >/dev/null 2>&1; then
+            echo "✓ Выбрана подсеть ${candidate_subnet}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
 update_system() {
     echo ""
     echo "=========================================="
@@ -78,8 +104,10 @@ install_lxd() {
     echo "=== Проверка/создание сети lxdbr0 ==="
     if ! lxc network show lxdbr0 >/dev/null 2>&1; then
         echo "⚠️ Сеть lxdbr0 отсутствует — создаём..."
-        lxc network create lxdbr0 ipv4.nat=true ipv6.address=none || {
+        create_lxdbr0_network || {
             echo "❌ Не удалось создать сеть lxdbr0"
+            echo "   Попробуйте вручную:"
+            echo "   lxc network create lxdbr0 ipv4.address=10.250.250.1/24 ipv4.nat=true ipv6.address=none"
             read -p "Нажмите Enter..." && return 1
         }
         echo "✅ Сеть lxdbr0 создана"
