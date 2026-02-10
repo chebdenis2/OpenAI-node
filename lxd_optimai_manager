@@ -301,9 +301,9 @@ container_has_outbound_access() {
             NO_PROXY="$GLOBAL_NO_PROXY" \
             bash -c '
                 if command -v curl >/dev/null 2>&1; then
-                    curl -fsS --max-time 10 https://download.docker.com >/dev/null 2>&1 ||
-                    curl -fsS --max-time 10 https://archive.ubuntu.com >/dev/null 2>&1 ||
-                    curl -fsS --max-time 10 https://security.ubuntu.com >/dev/null 2>&1
+                    curl -fsSI --max-time 20 https://download.docker.com >/dev/null 2>&1 ||
+                    curl -fsSI --max-time 20 https://archive.ubuntu.com >/dev/null 2>&1 ||
+                    curl -fsSI --max-time 20 https://security.ubuntu.com >/dev/null 2>&1
                 else
                     # Без curl считаем сеть потенциально рабочей и продолжаем установку.
                     exit 0
@@ -313,9 +313,9 @@ container_has_outbound_access() {
         lxc exec "$container" -- bash -c '
             ping -4 -c1 -W2 1.1.1.1 >/dev/null 2>&1 ||
             (command -v curl >/dev/null 2>&1 && (
-                curl -4fsS --max-time 8 https://download.docker.com >/dev/null 2>&1 ||
-                curl -4fsS --max-time 8 https://archive.ubuntu.com >/dev/null 2>&1 ||
-                curl -4fsS --max-time 8 https://security.ubuntu.com >/dev/null 2>&1
+                curl -4fsSI --max-time 20 https://download.docker.com >/dev/null 2>&1 ||
+                curl -4fsSI --max-time 20 https://archive.ubuntu.com >/dev/null 2>&1 ||
+                curl -4fsSI --max-time 20 https://security.ubuntu.com >/dev/null 2>&1
             )) ||
             timeout 8 bash -c "cat < /dev/null > /dev/tcp/1.1.1.1/443" >/dev/null 2>&1
         '
@@ -656,9 +656,7 @@ setup_docker() {
         fi
 
         if ! container_has_outbound_access "$container"; then
-            echo "❌ Нет интернета в $container (APT/Docker недоступны). Проверь прокси/фаервол/NAT."
-            failed_count=$((failed_count + 1))
-            continue
+            echo "⚠️ Проверка сети в $container не пройдена, но продолжаем установку (возможен ложный отрицательный результат)."
         fi
 
         echo "⏳ Ждем 5 секунд после запуска контейнера..."
