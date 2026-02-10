@@ -300,32 +300,75 @@ setup_docker() {
         echo ""
         echo "--- $container ---"
 
-        # Проверка: Docker есть и драйвер fuse-overlayfs
-        DOCKER_OK=$(lxc exec $container -- bash -c '
+        # Проверка: Docker уже установлен и совместимый storage driver активен
+        DOCKER_DRIVER=$(lxc exec "$container" -- bash -c '
             if command -v docker >/dev/null 2>&1; then
                 DRIVER=$(docker info --format "{{.Driver}}" 2>/dev/null || echo "none")
-                [ "$DRIVER" = "fuse-overlayfs" ] && echo "ok"
+                if [ "$DRIVER" = "fuse-overlayfs" ] || [ "$DRIVER" = "vfs" ]; then
+                    echo "$DRIVER"
+                fi
             fi
-        ')
+        ' 2>/dev/null || true)
 
-        if [ "$DOCKER_OK" = "ok" ]; then
-            echo "✓ Docker уже установлен и fuse-overlayfs активен, пропускаем"
+        if [ "$DOCKER_DRIVER" = "fuse-overlayfs" ] || [ "$DOCKER_DRIVER" = "vfs" ]; then
+            echo "✓ Docker уже установлен (storage-driver: $DOCKER_DRIVER), пропускаем"
+            continue
+        fi
+
+        if ! lxc exec "$container" -- bash -c 'ip -4 route show default | grep -q "^default"'; then
+            echo "⚠️ Нет default route. Перезапускаем контейнер..."
+            lxc restart "$container" >/dev/null 2>&1 || true
+            sleep 8
+        fi
+
+        if ! lxc exec "$container" -- bash -c 'ip -4 route show default | grep -q "^default"'; then
+            echo "❌ В $container нет default route. Запусти пункт 2 и проверь сеть lxdbr0."
             continue
         fi
 
         echo "⏳ Ждем 5 секунд после запуска контейнера..."
         sleep 5
 
-        lxc exec $container -- bash <<'EOF'
+        lxc exec "$container" -- bash <<'EOF'
 set -e
 
-echo "[1/6] Проверка nesting..."
+echo "[1/6] Проверка сетевой связности..."
+if ! ip -4 route show default | grep -q "^default"; then
+    echo "❌ Нет default route внутри контейнера"
+    exit 1
+fi
+if ! (ping -4 -c1 -W3 1.1.1.1 >/dev/null 2>&1 || curl -4fsS --max-time 8 https://download.docker.com >/dev/null 2>&1); then
+    echo "⚠️ Интернет нестабилен, применяем сетевой fallback для APT..."
+fi
 
-# [2/6] Установка fuse-overlayfs с retry
+echo "[2/6] Подготовка APT (IPv4 + HTTPS)..."
+cat > /etc/apt/apt.conf.d/99optimai-network <<APTCONF
+Acquire::ForceIPv4 "true";
+Acquire::Retries "3";
+Acquire::http::Timeout "20";
+Acquire::https::Timeout "20";
+APTCONF
+
+if [ -f /etc/apt/sources.list ]; then
+    sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g" \
+        /etc/apt/sources.list
+fi
+if ls /etc/apt/sources.list.d/*.list >/dev/null 2>&1; then
+    sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g" \
+        /etc/apt/sources.list.d/*.list 2>/dev/null || true
+fi
+
+echo "[3/6] Установка fuse-overlayfs (fallback: vfs)..."
+STORAGE_DRIVER="vfs"
 MAX_RETRIES=3
 for attempt in $(seq 1 $MAX_RETRIES); do
     echo "Попытка $attempt: установка fuse-overlayfs..."
-    if apt-get update -qq && apt-get install -y fuse-overlayfs -qq; then
+    if apt-get update -qq -o Acquire::ForceIPv4=true && apt-get install -y -qq fuse-overlayfs; then
+        STORAGE_DRIVER="fuse-overlayfs"
         echo "✓ fuse-overlayfs установлен"
         break
     else
@@ -333,44 +376,45 @@ for attempt in $(seq 1 $MAX_RETRIES); do
         if [ "$attempt" -lt "$MAX_RETRIES" ]; then
             echo "Ждем 5 секунд перед повтором..."
             sleep 5
-        else
-            echo "❌ fuse-overlayfs не удалось установить после $MAX_RETRIES попыток"
-            exit 1
         fi
     fi
 done
 
-# [3/6] Настройка daemon.json
+if [ "$STORAGE_DRIVER" = "vfs" ]; then
+    echo "⚠ fuse-overlayfs недоступен, используем vfs (медленнее, но совместимо)"
+fi
+
+# [4/6] Настройка daemon.json
 mkdir -p /etc/docker
 cat > /etc/docker/daemon.json <<JSON
 {
-  "storage-driver": "fuse-overlayfs"
+  "storage-driver": "${STORAGE_DRIVER}"
 }
 JSON
 
-# [4/6] Установка Docker, если нет
+# [5/6] Установка Docker, если нет
 if ! command -v docker >/dev/null 2>&1; then
     curl -fsSL https://get.docker.com | sh
 fi
 
-# [5/6] Запуск Docker
+# [6/6] Запуск Docker
 systemctl enable docker
-systemctl start docker
+systemctl restart docker
 sleep 3
 echo "=== Storage Driver ==="
-docker info | grep "Storage Driver"
+docker info --format "Storage Driver: {{.Driver}}"
 EOF
 
-        # [6/6] Скачивание образа с retry
+        # Скачивание образа с retry
         IMAGE="unclecode/crawl4ai:0.7.3"
         MAX_PULL_RETRIES=3
         for attempt in $(seq 1 $MAX_PULL_RETRIES); do
-            if lxc exec $container -- docker images | grep -q "unclecode/crawl4ai.*0.7.3"; then
+            if lxc exec "$container" -- docker images | grep -q "unclecode/crawl4ai.*0.7.3"; then
                 echo "✓ Образ crawl4ai уже есть"
                 break
             else
                 echo "📦 Попытка $attempt: скачиваем $IMAGE..."
-                if lxc exec $container -- docker pull $IMAGE; then
+                if lxc exec "$container" -- docker pull "$IMAGE"; then
                     echo "✓ Образ скачан"
                     break
                 else
@@ -387,7 +431,7 @@ EOF
     done
 
     echo ""
-    echo "✅ Docker + fuse-overlayfs настроены корректно"
+    echo "✅ Docker настроен (storage-driver: fuse-overlayfs или vfs)"
     read -p "Нажми Enter..."
 }
 
