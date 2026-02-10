@@ -1060,62 +1060,106 @@ EOF
 # ============================================
 
 start_nodes() {
-local max=$(get_max_container)
-echo "Какие ноды запустить? (например: 5, 1-10 или Enter для всех 1-$max)"
-read -r range
-result=$(parse_range "$range")
-if [ $? -ne 0 ]; then
-echo "✗ $result"
-read -p "Нажми Enter для продолжения..."
-return
-fi
-start=$(echo $result | cut -d' ' -f1)
-end=$(echo $result | cut -d' ' -f2)
-if [ "$start" -eq "$end" ]; then
-echo "Запуск ${CONTAINER_PREFIX}${start}..."
-else
-echo "Запуск нод с ${CONTAINER_PREFIX}${start} по ${CONTAINER_PREFIX}${end}..."
-fi
-for i in $(seq $start $end); do
-echo "[$i] Запуск ${CONTAINER_PREFIX}${i}..."
-lxc exec ${CONTAINER_PREFIX}${i} -- bash << 'SCRIPT'
+    local max=$(get_max_container)
+    echo "Какие ноды запустить? (например: 5, 1-10 или Enter для всех 1-$max)"
+    read -r range
+    result=$(parse_range "$range")
+    if [ $? -ne 0 ]; then
+        echo "✗ $result"
+        read -p "Нажми Enter для продолжения..."
+        return
+    fi
+
+    start=$(echo $result | cut -d' ' -f1)
+    end=$(echo $result | cut -d' ' -f2)
+    if [ "$start" -eq "$end" ]; then
+        echo "Запуск ${CONTAINER_PREFIX}${start}..."
+    else
+        echo "Запуск нод с ${CONTAINER_PREFIX}${start} по ${CONTAINER_PREFIX}${end}..."
+    fi
+
+    for i in $(seq $start $end); do
+        node_name="${CONTAINER_PREFIX}${i}"
+        echo "[$i] Запуск ${node_name}..."
+        lxc list -c n --format csv | grep -q "^${node_name}$" || { echo "нет"; continue; }
+
+        if ! lxc exec "$node_name" -- bash << 'SCRIPT'
+set -e
 mkdir -p /var/log/optimai
-echo "[DEBUG] Остановка старых процессов..."
-pkill -9 -f 'optimai-cli' 2>/dev/null
-sleep 1
+
+echo "[DEBUG] Проверка optimai-cli..."
+if [ ! -x /usr/local/bin/optimai-cli ]; then
+    echo "✗ ОШИБКА: /usr/local/bin/optimai-cli не найден!"
+    exit 1
+fi
+
 echo "[DEBUG] Проверка Docker..."
 if ! systemctl is-active docker >/dev/null 2>&1; then
-echo "[DEBUG] Запуск Docker..."
-systemctl start docker
-sleep 3
+    echo "[DEBUG] Запуск Docker..."
+    systemctl start docker || true
+    sleep 3
 fi
-echo "[DEBUG] Проверка optimai-cli..."
-if [ ! -f /usr/local/bin/optimai-cli ]; then
-echo "✗ ОШИБКА: optimai-cli не найден!"
-exit 1
+
+if ! timeout 20 docker ps -a >/dev/null 2>&1; then
+    echo "[DEBUG] Docker не отвечает, перезапускаем..."
+    systemctl restart docker || true
+    sleep 5
 fi
-echo "[DEBUG] Запуск ноды..."
-cd /root
-nohup /usr/local/bin/optimai-cli node start >> /var/log/optimai/node.log 2>&1 &
-sleep 3
-if pgrep -f 'optimai-cli' >/dev/null; then
-PID=$(pgrep -f 'optimai-cli')
-echo "✓ Процесс запущен (PID: $PID)"
+
+if ! timeout 20 docker ps -a >/dev/null 2>&1; then
+    echo "✗ ОШИБКА: Docker не отвечает (docker ps timeout)"
+    systemctl status docker --no-pager -l | tail -40 || true
+    exit 1
+fi
+
+echo "[DEBUG] Настройка systemd сервиса optimai-node..."
+cat > /etc/systemd/system/optimai-node.service <<'UNIT'
+[Unit]
+Description=OptimAI node service
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root
+EnvironmentFile=-/etc/environment.d/90-optimai-proxy.conf
+ExecStart=/usr/local/bin/optimai-cli node start
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=0
+StandardOutput=append:/var/log/optimai/node.log
+StandardError=append:/var/log/optimai/node.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable optimai-node >/dev/null 2>&1 || true
+systemctl restart optimai-node
+sleep 5
+
+if systemctl is-active optimai-node >/dev/null 2>&1; then
+    echo "✓ optimai-node service запущен"
 else
-echo "✗ Ошибка запуска! Лог:"
-if [ -f /var/log/optimai/node.log ]; then
-tail -20 /var/log/optimai/node.log
-else
-echo "Лог файл не создан"
-fi
-exit 1
+    echo "✗ optimai-node не запустился. Последние логи:"
+    journalctl -u optimai-node -n 40 --no-pager || true
+    exit 1
 fi
 SCRIPT
-echo ""
-sleep 2
-done
-echo "✓ Запуск завершен"
-read -p "Нажми Enter для продолжения..."
+        then
+            echo "✓ ${node_name} запущен"
+        else
+            echo "✗ Ошибка запуска ${node_name}"
+        fi
+
+        echo ""
+        sleep 2
+    done
+
+    echo "✓ Запуск завершен"
+    read -p "Нажми Enter для продолжения..."
 }
 
 
@@ -1134,20 +1178,27 @@ stop_nodes() {
         lxc list -c n --format csv | grep -q "^${CONTAINER_PREFIX}${i}$" || { echo "нет"; continue; }
         
         lxc exec "${CONTAINER_PREFIX}${i}" -- bash -c '
+            systemctl stop optimai-node 2>/dev/null || true
+            systemctl disable optimai-node 2>/dev/null || true
+
             echo "Останавливаем Docker контейнеры..."
-            docker stop optimai_crawl4ai_0_7_3 2>/dev/null || true
-            docker rm optimai_crawl4ai_0_7_3 2>/dev/null || true
-            docker system prune -f -q 2>/dev/null || true
+            timeout 20 docker stop optimai_crawl4ai_0_7_3 2>/dev/null || true
+            timeout 20 docker rm optimai_crawl4ai_0_7_3 2>/dev/null || true
+            timeout 30 docker system prune -f -q 2>/dev/null || true
             
             echo "Останавливаем optimai-cli..."
-            pkill -9 -f "optimai-cli" 2>/dev/null || true
+            pkill -9 -f "/usr/local/bin/optimai-cli" 2>/dev/null || true
             sleep 2
             
             echo "Очистка логов..."
             rm -f /var/log/optimai/node.log
             
             echo "Docker статус: "
-            docker ps -q | wc -l | xargs -I {} echo "{} crawl4ai контейнеров осталось"
+            if timeout 10 docker ps -q >/dev/null 2>&1; then
+                docker ps -q | wc -l | xargs -I {} echo "{} docker контейнеров осталось"
+            else
+                echo "Docker не отвечает"
+            fi
             echo "Лог очищен"
         '
         echo "✓ остановлено"
@@ -1211,7 +1262,13 @@ check_status() {
     echo "=== СТАТУС НОД ==="
     for i in $(seq 1 $(get_max_container)); do
         if lxc list -c n --format csv | grep -q "^${CONTAINER_PREFIX}${i}$"; then
-            status=$(lxc exec ${CONTAINER_PREFIX}${i} -- pgrep -f "optimai-cli" >/dev/null 2>&1 && echo "РАБОТАЕТ" || echo "ОСТАНОВЛЕНА")
+            status=$(lxc exec ${CONTAINER_PREFIX}${i} -- bash -c '
+                if systemctl list-unit-files | grep -q "^optimai-node.service"; then
+                    systemctl is-active --quiet optimai-node && echo "РАБОТАЕТ" || echo "ОСТАНОВЛЕНА"
+                else
+                    pgrep -f "optimai-cli" >/dev/null 2>&1 && echo "РАБОТАЕТ" || echo "ОСТАНОВЛЕНА"
+                fi
+            ')
             echo "${CONTAINER_PREFIX}${i}: $status"
         fi
     done
