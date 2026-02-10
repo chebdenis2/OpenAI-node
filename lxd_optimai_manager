@@ -1083,7 +1083,7 @@ start_nodes() {
         echo "[$i] Запуск ${node_name}..."
         lxc list -c n --format csv | grep -q "^${node_name}$" || { echo "нет"; continue; }
 
-        if ! lxc exec "$node_name" -- bash << 'SCRIPT'
+        if lxc exec "$node_name" -- bash << 'SCRIPT'
 set -e
 mkdir -p /var/log/optimai
 
