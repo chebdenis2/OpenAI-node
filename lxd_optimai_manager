@@ -5,6 +5,15 @@ set -e
 CONTAINER_PREFIX="node"
 # Файл для хранения учетных данных
 CREDENTIALS_FILE="/root/.optimai_credentials"
+LXD_SUBNET_CANDIDATES=(
+    "10.10.10.1/24"
+    "10.20.20.1/24"
+    "10.30.30.1/24"
+    "10.40.40.1/24"
+    "10.250.250.1/24"
+    "172.31.250.1/24"
+    "192.168.250.1/24"
+)
 
 # Проверка root прав
 if [[ $EUID -ne 0 ]]; then
@@ -25,13 +34,7 @@ create_lxdbr0_network() {
     fi
 
     echo "⚠️ Авто-конфигурация не удалась. Пробуем фиксированные подсети..."
-    for candidate_subnet in \
-        "10.10.10.1/24" \
-        "10.20.20.1/24" \
-        "10.30.30.1/24" \
-        "10.40.40.1/24" \
-        "172.31.250.1/24" \
-        "192.168.250.1/24"; do
+    for candidate_subnet in "${LXD_SUBNET_CANDIDATES[@]}"; do
         echo "→ Пробуем подсеть ${candidate_subnet}"
         if lxc network create lxdbr0 ipv4.address="${candidate_subnet}" ipv4.nat=true ipv6.address=none >/dev/null 2>&1; then
             echo "✓ Выбрана подсеть ${candidate_subnet}"
@@ -40,6 +43,69 @@ create_lxdbr0_network() {
     done
 
     return 1
+}
+
+ensure_host_ipv4_forwarding() {
+    local current_forward
+    current_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
+
+    if [ "$current_forward" != "1" ]; then
+        echo "⚠️ net.ipv4.ip_forward выключен. Включаем..."
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    fi
+
+    mkdir -p /etc/sysctl.d
+    if [ -f /etc/sysctl.d/99-lxd-forwarding.conf ]; then
+        sed -i '/^net\.ipv4\.ip_forward=/d' /etc/sysctl.d/99-lxd-forwarding.conf
+    fi
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/99-lxd-forwarding.conf
+}
+
+ensure_lxdbr0_network_health() {
+    local candidate_subnet
+    local ipv4_address ipv4_nat ipv4_dhcp ipv6_address
+
+    if ! lxc network show lxdbr0 >/dev/null 2>&1; then
+        create_lxdbr0_network || return 1
+    fi
+
+    ipv4_address=$(lxc network get lxdbr0 ipv4.address 2>/dev/null || true)
+    ipv4_nat=$(lxc network get lxdbr0 ipv4.nat 2>/dev/null || true)
+    ipv4_dhcp=$(lxc network get lxdbr0 ipv4.dhcp 2>/dev/null || true)
+    ipv6_address=$(lxc network get lxdbr0 ipv6.address 2>/dev/null || true)
+
+    if [ -z "$ipv4_address" ] || [ "$ipv4_address" = "none" ]; then
+        echo "⚠️ Для lxdbr0 не задан ipv4.address. Исправляем..."
+        for candidate_subnet in "${LXD_SUBNET_CANDIDATES[@]}"; do
+            if lxc network set lxdbr0 ipv4.address="$candidate_subnet" >/dev/null 2>&1; then
+                ipv4_address="$candidate_subnet"
+                echo "✓ Установлен ipv4.address=${candidate_subnet}"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$ipv4_address" ] || [ "$ipv4_address" = "none" ]; then
+        echo "❌ Не удалось установить ipv4.address для lxdbr0"
+        return 1
+    fi
+
+    if [ "$ipv4_nat" != "true" ]; then
+        echo "→ Включаем ipv4.nat=true для lxdbr0"
+        lxc network set lxdbr0 ipv4.nat true >/dev/null 2>&1 || true
+    fi
+
+    if [ "$ipv4_dhcp" != "true" ]; then
+        echo "→ Включаем ipv4.dhcp=true для lxdbr0"
+        lxc network set lxdbr0 ipv4.dhcp true >/dev/null 2>&1 || true
+    fi
+
+    if [ "$ipv6_address" != "none" ]; then
+        lxc network set lxdbr0 ipv6.address none >/dev/null 2>&1 || true
+    fi
+
+    echo "✓ lxdbr0: ipv4.address=$(lxc network get lxdbr0 ipv4.address 2>/dev/null || echo "unknown"), ipv4.nat=$(lxc network get lxdbr0 ipv4.nat 2>/dev/null || echo "unknown"), ipv4.dhcp=$(lxc network get lxdbr0 ipv4.dhcp 2>/dev/null || echo "unknown")"
+    return 0
 }
 
 update_system() {
@@ -114,6 +180,13 @@ install_lxd() {
     else
         echo "✓ Сеть lxdbr0 уже существует"
     fi
+
+    echo "=== Проверка параметров lxdbr0 и host forwarding ==="
+    ensure_host_ipv4_forwarding
+    ensure_lxdbr0_network_health || {
+        echo "❌ lxdbr0 настроен некорректно. Исправьте сеть и повторите пункт 2."
+        read -p "Нажмите Enter..." && return 1
+    }
 
     # Проверка storage pool
     if ! lxc storage show default >/dev/null 2>&1; then
@@ -296,6 +369,16 @@ setup_docker() {
     CONTAINERS=$(lxc list -c n --format csv | grep "^${CONTAINER_PREFIX}")
     [ -z "$CONTAINERS" ] && { echo "❌ Контейнеры не найдены"; read -p "Enter..."; return; }
 
+    echo "=== Проверка сети LXD перед установкой Docker ==="
+    ensure_host_ipv4_forwarding
+    ensure_lxdbr0_network_health || {
+        echo "❌ Сеть lxdbr0 не готова. Сначала повтори пункт 2."
+        read -p "Нажми Enter..." && return
+    }
+
+    configured_count=0
+    failed_count=0
+
     for container in $CONTAINERS; do
         echo ""
         echo "--- $container ---"
@@ -312,6 +395,7 @@ setup_docker() {
 
         if [ "$DOCKER_DRIVER" = "fuse-overlayfs" ] || [ "$DOCKER_DRIVER" = "vfs" ]; then
             echo "✓ Docker уже установлен (storage-driver: $DOCKER_DRIVER), пропускаем"
+            configured_count=$((configured_count + 1))
             continue
         fi
 
@@ -323,13 +407,28 @@ setup_docker() {
 
         if ! lxc exec "$container" -- bash -c 'ip -4 route show default | grep -q "^default"'; then
             echo "❌ В $container нет default route. Запусти пункт 2 и проверь сеть lxdbr0."
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+
+        if ! lxc exec "$container" -- bash -c 'ping -4 -c1 -W3 1.1.1.1 >/dev/null 2>&1 || curl -4fsS --max-time 8 https://download.docker.com >/dev/null 2>&1'; then
+            echo "⚠️ Нет исходящего трафика в $container. Пробуем восстановить сеть..."
+            ensure_host_ipv4_forwarding
+            ensure_lxdbr0_network_health || true
+            lxc restart "$container" >/dev/null 2>&1 || true
+            sleep 8
+        fi
+
+        if ! lxc exec "$container" -- bash -c 'ping -4 -c1 -W3 1.1.1.1 >/dev/null 2>&1 || curl -4fsS --max-time 8 https://download.docker.com >/dev/null 2>&1'; then
+            echo "❌ Нет интернета в $container (APT/Docker недоступны). Проверь firewall VPS и NAT."
+            failed_count=$((failed_count + 1))
             continue
         fi
 
         echo "⏳ Ждем 5 секунд после запуска контейнера..."
         sleep 5
 
-        lxc exec "$container" -- bash <<'EOF'
+        if ! lxc exec "$container" -- bash <<'EOF'
 set -e
 
 echo "[1/6] Проверка сетевой связности..."
@@ -394,7 +493,14 @@ JSON
 
 # [5/6] Установка Docker, если нет
 if ! command -v docker >/dev/null 2>&1; then
-    curl -fsSL https://get.docker.com | sh
+    if ! curl -4fsSL --retry 3 --retry-delay 3 --connect-timeout 10 https://get.docker.com | sh; then
+        echo "⚠ get.docker.com недоступен, пробуем docker.io из apt..."
+        apt-get update -qq -o Acquire::ForceIPv4=true || true
+        apt-get install -y -qq docker.io || {
+            echo "❌ Не удалось установить Docker"
+            exit 1
+        }
+    fi
 fi
 
 # [6/6] Запуск Docker
@@ -404,6 +510,13 @@ sleep 3
 echo "=== Storage Driver ==="
 docker info --format "Storage Driver: {{.Driver}}"
 EOF
+        then
+            echo "❌ Ошибка настройки Docker внутри $container"
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+
+        configured_count=$((configured_count + 1))
 
         # Скачивание образа с retry
         IMAGE="unclecode/crawl4ai:0.7.3"
@@ -431,7 +544,7 @@ EOF
     done
 
     echo ""
-    echo "✅ Docker настроен (storage-driver: fuse-overlayfs или vfs)"
+    echo "✅ Docker настройка завершена: успешно $configured_count, с ошибками $failed_count"
     read -p "Нажми Enter..."
 }
 
