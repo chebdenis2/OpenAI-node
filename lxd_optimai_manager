@@ -232,11 +232,13 @@ prompt_proxy_settings() {
 
 apply_proxy_settings_to_container() {
     local container="$1"
+    local proxy_url="${2:-$GLOBAL_PROXY_URL}"
+    local no_proxy_value="${3:-$GLOBAL_NO_PROXY}"
 
     [ -z "$container" ] && return 1
 
-    if [ -n "$GLOBAL_PROXY_URL" ]; then
-        lxc exec "$container" -- bash -s -- "$GLOBAL_PROXY_URL" "$GLOBAL_NO_PROXY" <<'EOF'
+    if [ -n "$proxy_url" ]; then
+        lxc exec "$container" -- bash -s -- "$proxy_url" "$no_proxy_value" <<'EOF'
 set -e
 PROXY_URL="$1"
 NO_PROXY_VALUE="$2"
@@ -289,16 +291,18 @@ EOF
 
 container_has_outbound_access() {
     local container="$1"
+    local proxy_url="${2:-$GLOBAL_PROXY_URL}"
+    local no_proxy_value="${3:-$GLOBAL_NO_PROXY}"
     [ -z "$container" ] && return 1
 
-    if [ -n "$GLOBAL_PROXY_URL" ]; then
+    if [ -n "$proxy_url" ]; then
         lxc exec "$container" -- env \
-            http_proxy="$GLOBAL_PROXY_URL" \
-            https_proxy="$GLOBAL_PROXY_URL" \
-            HTTP_PROXY="$GLOBAL_PROXY_URL" \
-            HTTPS_PROXY="$GLOBAL_PROXY_URL" \
-            no_proxy="$GLOBAL_NO_PROXY" \
-            NO_PROXY="$GLOBAL_NO_PROXY" \
+            http_proxy="$proxy_url" \
+            https_proxy="$proxy_url" \
+            HTTP_PROXY="$proxy_url" \
+            HTTPS_PROXY="$proxy_url" \
+            no_proxy="$no_proxy_value" \
+            NO_PROXY="$no_proxy_value" \
             bash -c '
                 if command -v curl >/dev/null 2>&1; then
                     curl -fsSI --max-time 20 https://download.docker.com >/dev/null 2>&1 ||
@@ -308,6 +312,13 @@ container_has_outbound_access() {
                     # Без curl считаем сеть потенциально рабочей и продолжаем установку.
                     exit 0
                 fi
+            ' || lxc exec "$container" -- bash -c '
+                (command -v curl >/dev/null 2>&1 && (
+                    curl -4fsSI --max-time 20 https://download.docker.com >/dev/null 2>&1 ||
+                    curl -4fsSI --max-time 20 https://archive.ubuntu.com >/dev/null 2>&1 ||
+                    curl -4fsSI --max-time 20 https://security.ubuntu.com >/dev/null 2>&1
+                )) ||
+                timeout 8 bash -c "cat < /dev/null > /dev/tcp/1.1.1.1/443" >/dev/null 2>&1
             '
     else
         lxc exec "$container" -- bash -c '
@@ -633,55 +644,78 @@ setup_docker() {
             continue
         fi
 
-        apply_proxy_settings_to_container "$container" || true
+        container_proxy_url="$GLOBAL_PROXY_URL"
+        container_no_proxy="$GLOBAL_NO_PROXY"
 
-        if ! container_has_outbound_access "$container"; then
+        if [ -n "$container_proxy_url" ]; then
+            if ! container_has_outbound_access "$container" "$container_proxy_url" "$container_no_proxy"; then
+                if container_has_outbound_access "$container" "" "$container_no_proxy"; then
+                    echo "⚠️ Сохранённый proxy для $container нестабилен. Используем прямой выход."
+                    container_proxy_url=""
+                fi
+            fi
+        fi
+
+        apply_proxy_settings_to_container "$container" "$container_proxy_url" "$container_no_proxy" || true
+
+        if ! container_has_outbound_access "$container" "$container_proxy_url" "$container_no_proxy"; then
             echo "⚠️ Нет исходящего трафика в $container. Пробуем восстановить сеть..."
             ensure_host_ipv4_forwarding
             ensure_lxdbr0_network_health || true
             ensure_manual_lxd_nat_rules || true
             lxc restart "$container" >/dev/null 2>&1 || true
             sleep 8
-            apply_proxy_settings_to_container "$container" || true
+            apply_proxy_settings_to_container "$container" "$container_proxy_url" "$container_no_proxy" || true
         fi
 
-        if ! container_has_outbound_access "$container"; then
-            if [ -z "$GLOBAL_PROXY_URL" ] && [ "$proxy_prompted" -eq 0 ]; then
+        if ! container_has_outbound_access "$container" "$container_proxy_url" "$container_no_proxy"; then
+            if [ -z "$container_proxy_url" ] && [ -z "$GLOBAL_PROXY_URL" ] && [ "$proxy_prompted" -eq 0 ]; then
                 proxy_prompted=1
                 if prompt_proxy_settings; then
                     echo "→ Применяем прокси к контейнерам..."
-                    apply_proxy_settings_to_container "$container" || true
+                    container_proxy_url="$GLOBAL_PROXY_URL"
+                    container_no_proxy="$GLOBAL_NO_PROXY"
+                    apply_proxy_settings_to_container "$container" "$container_proxy_url" "$container_no_proxy" || true
                 fi
             fi
         fi
 
-        if ! container_has_outbound_access "$container"; then
+        if ! container_has_outbound_access "$container" "$container_proxy_url" "$container_no_proxy"; then
             echo "⚠️ Проверка сети в $container не пройдена, но продолжаем установку (возможен ложный отрицательный результат)."
         fi
 
         echo "⏳ Ждем 5 секунд после запуска контейнера..."
         sleep 5
 
-        if ! lxc exec "$container" -- bash -s -- "$GLOBAL_PROXY_URL" "$GLOBAL_NO_PROXY" <<'EOF'
+        if ! lxc exec "$container" -- bash -s -- "$container_proxy_url" "$container_no_proxy" <<'EOF'
 set -e
 PROXY_URL="$1"
 NO_PROXY_VALUE="$2"
 
-if [ -n "$PROXY_URL" ]; then
-    export http_proxy="$PROXY_URL"
-    export https_proxy="$PROXY_URL"
-    export HTTP_PROXY="$PROXY_URL"
-    export HTTPS_PROXY="$PROXY_URL"
-    export no_proxy="$NO_PROXY_VALUE"
-    export NO_PROXY="$NO_PROXY_VALUE"
+ACTIVE_PROXY_URL="$PROXY_URL"
 
-    cat > /etc/apt/apt.conf.d/98optimai-proxy <<APT_PROXY
-Acquire::http::Proxy "${PROXY_URL}";
-Acquire::https::Proxy "${PROXY_URL}";
+apply_proxy_profile() {
+    if [ -n "$ACTIVE_PROXY_URL" ]; then
+        export http_proxy="$ACTIVE_PROXY_URL"
+        export https_proxy="$ACTIVE_PROXY_URL"
+        export HTTP_PROXY="$ACTIVE_PROXY_URL"
+        export HTTPS_PROXY="$ACTIVE_PROXY_URL"
+        export no_proxy="$NO_PROXY_VALUE"
+        export NO_PROXY="$NO_PROXY_VALUE"
+
+        cat > /etc/apt/apt.conf.d/98optimai-proxy <<APT_PROXY
+Acquire::http::Proxy "${ACTIVE_PROXY_URL}";
+Acquire::https::Proxy "${ACTIVE_PROXY_URL}";
 APT_PROXY
-else
-    rm -f /etc/apt/apt.conf.d/98optimai-proxy
-fi
+    else
+        unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
+        rm -f /etc/apt/apt.conf.d/98optimai-proxy
+        rm -f /etc/environment.d/90-optimai-proxy.conf
+        rm -f /etc/profile.d/optimai-proxy.sh
+    fi
+}
+
+apply_proxy_profile
 
 echo "[1/6] Проверка сетевой связности..."
 if ! ip -4 route show default | grep -q "^default"; then
@@ -723,6 +757,12 @@ for attempt in $(seq 1 $MAX_RETRIES); do
         echo "✓ fuse-overlayfs установлен"
         break
     else
+        if [ -n "$ACTIVE_PROXY_URL" ]; then
+            echo "⚠ Прокси нестабилен, переключаемся на прямое соединение и повторяем..."
+            ACTIVE_PROXY_URL=""
+            apply_proxy_profile
+            continue
+        fi
         echo "⚠ Попытка $attempt не удалась"
         if [ "$attempt" -lt "$MAX_RETRIES" ]; then
             echo "Ждем 5 секунд перед повтором..."
@@ -746,22 +786,32 @@ JSON
 # [5/6] Установка Docker, если нет
 if ! command -v docker >/dev/null 2>&1; then
     if ! curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 10 https://get.docker.com | sh; then
-        echo "⚠ get.docker.com недоступен, пробуем docker.io из apt..."
-        apt-get update -qq -o Acquire::ForceIPv4=true || true
-        apt-get install -y -qq docker.io || {
-            echo "❌ Не удалось установить Docker"
-            exit 1
-        }
+        if [ -n "$ACTIVE_PROXY_URL" ]; then
+            echo "⚠ get.docker.com через proxy недоступен, пробуем напрямую..."
+            ACTIVE_PROXY_URL=""
+            apply_proxy_profile
+        fi
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        if ! curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 10 https://get.docker.com | sh; then
+            echo "⚠ get.docker.com недоступен, пробуем docker.io из apt..."
+            apt-get update -qq -o Acquire::ForceIPv4=true || true
+            apt-get install -y -qq docker.io || {
+                echo "❌ Не удалось установить Docker"
+                exit 1
+            }
+        fi
     fi
 fi
 
 # [6/6] Запуск Docker
-if [ -n "$PROXY_URL" ]; then
+if [ -n "$ACTIVE_PROXY_URL" ]; then
     mkdir -p /etc/systemd/system/docker.service.d
     cat > /etc/systemd/system/docker.service.d/http-proxy.conf <<DOCKER_PROXY
 [Service]
-Environment="HTTP_PROXY=${PROXY_URL}"
-Environment="HTTPS_PROXY=${PROXY_URL}"
+Environment="HTTP_PROXY=${ACTIVE_PROXY_URL}"
+Environment="HTTPS_PROXY=${ACTIVE_PROXY_URL}"
 Environment="NO_PROXY=${NO_PROXY_VALUE}"
 DOCKER_PROXY
 else
