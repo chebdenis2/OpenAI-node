@@ -145,14 +145,7 @@ load_proxy_settings() {
 }
 
 save_proxy_settings() {
-    local escaped_proxy escaped_no_proxy
-    escaped_proxy=${GLOBAL_PROXY_URL//\"/\\\"}
-    escaped_no_proxy=${GLOBAL_NO_PROXY//\"/\\\"}
-
-    cat > "$PROXY_SETTINGS_FILE" <<EOF
-PROXY_URL="${escaped_proxy}"
-PROXY_NO_PROXY="${escaped_no_proxy}"
-EOF
+    printf 'PROXY_URL=%q\nPROXY_NO_PROXY=%q\n' "$GLOBAL_PROXY_URL" "$GLOBAL_NO_PROXY" > "$PROXY_SETTINGS_FILE"
     chmod 600 "$PROXY_SETTINGS_FILE"
 }
 
@@ -206,13 +199,14 @@ Acquire::http::Proxy "${PROXY_URL}";
 Acquire::https::Proxy "${PROXY_URL}";
 APT_PROXY
 
-cat > /etc/environment <<ENV_FILE
-http_proxy="${PROXY_URL}"
-https_proxy="${PROXY_URL}"
-HTTP_PROXY="${PROXY_URL}"
-HTTPS_PROXY="${PROXY_URL}"
-no_proxy="${NO_PROXY_VALUE}"
-NO_PROXY="${NO_PROXY_VALUE}"
+mkdir -p /etc/environment.d
+cat > /etc/environment.d/90-optimai-proxy.conf <<ENV_FILE
+http_proxy=${PROXY_URL}
+https_proxy=${PROXY_URL}
+HTTP_PROXY=${PROXY_URL}
+HTTPS_PROXY=${PROXY_URL}
+no_proxy=${NO_PROXY_VALUE}
+NO_PROXY=${NO_PROXY_VALUE}
 ENV_FILE
 
 cat > /etc/profile.d/optimai-proxy.sh <<ENV_SH
@@ -238,6 +232,7 @@ EOF
     else
         lxc exec "$container" -- bash -c '
             rm -f /etc/apt/apt.conf.d/98optimai-proxy
+            rm -f /etc/environment.d/90-optimai-proxy.conf
             rm -f /etc/profile.d/optimai-proxy.sh
             rm -f /etc/systemd/system/docker.service.d/http-proxy.conf
             systemctl daemon-reload >/dev/null 2>&1 || true
