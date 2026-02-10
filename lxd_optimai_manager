@@ -3,6 +3,7 @@ set -e
 
 # Глобальная переменная для префикса контейнеров
 CONTAINER_PREFIX="node"
+SCRIPT_VERSION="2026-02-10.1"
 # Файл для хранения учетных данных
 CREDENTIALS_FILE="/root/.optimai_credentials"
 PROXY_SETTINGS_FILE="/root/.optimai_proxy"
@@ -1151,7 +1152,8 @@ SCRIPT
         then
             echo "✓ ${node_name} запущен"
         else
-            echo "✗ Ошибка запуска ${node_name}"
+            rc=$?
+            echo "✗ Ошибка запуска ${node_name} (код: $rc)"
         fi
 
         echo ""
@@ -1289,6 +1291,7 @@ while true; do
     clear
     echo "=========================================="
     echo " LXD + DOCKER + OPTIMAI MANAGER"
+    echo " Version: ${SCRIPT_VERSION}"
     echo "=========================================="
     echo ""
 
