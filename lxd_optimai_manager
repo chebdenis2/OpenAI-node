@@ -112,6 +112,53 @@ ensure_lxdbr0_network_health() {
     return 0
 }
 
+get_lxdbr0_subnet_cidr() {
+    local bridge_addr
+    bridge_addr=$(lxc network get lxdbr0 ipv4.address 2>/dev/null || true)
+    if [ -z "$bridge_addr" ] || [ "$bridge_addr" = "none" ]; then
+        return 1
+    fi
+
+    python3 - "$bridge_addr" <<'PY'
+import ipaddress
+import sys
+
+try:
+    print(ipaddress.ip_interface(sys.argv[1]).network.with_prefixlen)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+ensure_manual_lxd_nat_rules() {
+    local uplink_if lxd_subnet
+
+    uplink_if=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')
+    lxd_subnet=$(get_lxdbr0_subnet_cidr 2>/dev/null || true)
+
+    if [ -z "$uplink_if" ] || [ -z "$lxd_subnet" ]; then
+        return 1
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -C FORWARD -i lxdbr0 -o "$uplink_if" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -i lxdbr0 -o "$uplink_if" -j ACCEPT
+        iptables -C FORWARD -i "$uplink_if" -o lxdbr0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -i "$uplink_if" -o lxdbr0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -t nat -C POSTROUTING -s "$lxd_subnet" -o "$uplink_if" -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -I POSTROUTING 1 -s "$lxd_subnet" -o "$uplink_if" -j MASQUERADE
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -C FORWARD -i lxdbr0 -o "$uplink_if" -j ACCEPT 2>/dev/null || \
+            ip6tables -I FORWARD 1 -i lxdbr0 -o "$uplink_if" -j ACCEPT
+        ip6tables -C FORWARD -i "$uplink_if" -o lxdbr0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+            ip6tables -I FORWARD 1 -i "$uplink_if" -o lxdbr0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    fi
+
+    return 0
+}
+
 load_proxy_settings() {
     GLOBAL_PROXY_URL=""
     GLOBAL_NO_PROXY="$DEFAULT_NO_PROXY"
@@ -265,7 +312,11 @@ container_has_outbound_access() {
     else
         lxc exec "$container" -- bash -c '
             ping -4 -c1 -W2 1.1.1.1 >/dev/null 2>&1 ||
-            (command -v curl >/dev/null 2>&1 && curl -4fsS --max-time 8 https://download.docker.com >/dev/null 2>&1) ||
+            (command -v curl >/dev/null 2>&1 && (
+                curl -4fsS --max-time 8 https://download.docker.com >/dev/null 2>&1 ||
+                curl -4fsS --max-time 8 https://archive.ubuntu.com >/dev/null 2>&1 ||
+                curl -4fsS --max-time 8 https://security.ubuntu.com >/dev/null 2>&1
+            )) ||
             timeout 8 bash -c "cat < /dev/null > /dev/tcp/1.1.1.1/443" >/dev/null 2>&1
         '
     fi
@@ -350,6 +401,7 @@ install_lxd() {
         echo "❌ lxdbr0 настроен некорректно. Исправьте сеть и повторите пункт 2."
         read -p "Нажмите Enter..." && return 1
     }
+    ensure_manual_lxd_nat_rules || true
 
     # Проверка storage pool
     if ! lxc storage show default >/dev/null 2>&1; then
@@ -538,6 +590,7 @@ setup_docker() {
         echo "❌ Сеть lxdbr0 не готова. Сначала повтори пункт 2."
         read -p "Нажми Enter..." && return
     }
+    ensure_manual_lxd_nat_rules || true
 
     load_proxy_settings
     proxy_prompted=0
@@ -586,6 +639,7 @@ setup_docker() {
             echo "⚠️ Нет исходящего трафика в $container. Пробуем восстановить сеть..."
             ensure_host_ipv4_forwarding
             ensure_lxdbr0_network_health || true
+            ensure_manual_lxd_nat_rules || true
             lxc restart "$container" >/dev/null 2>&1 || true
             sleep 8
             apply_proxy_settings_to_container "$container" || true
