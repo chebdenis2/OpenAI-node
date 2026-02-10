@@ -1172,12 +1172,14 @@ stop_nodes() {
 
     start=$(echo $result | cut -d' ' -f1)
     end=$(echo $result | cut -d' ' -f2)
+    local success_count=0
+    local failed_count=0
 
     for i in $(seq $start $end); do
         echo -n "[$i] ${CONTAINER_PREFIX}${i}: "
         lxc list -c n --format csv | grep -q "^${CONTAINER_PREFIX}${i}$" || { echo "нет"; continue; }
         
-        lxc exec "${CONTAINER_PREFIX}${i}" -- bash -c '
+        if lxc exec "${CONTAINER_PREFIX}${i}" -- bash -c '
             systemctl stop optimai-node 2>/dev/null || true
             systemctl disable optimai-node 2>/dev/null || true
 
@@ -1187,7 +1189,8 @@ stop_nodes() {
             timeout 30 docker system prune -f -q 2>/dev/null || true
             
             echo "Останавливаем optimai-cli..."
-            pkill -9 -f "/usr/local/bin/optimai-cli" 2>/dev/null || true
+            # Важно: используем -x, чтобы не убить текущий bash -c по совпадению строки.
+            pkill -9 -x optimai-cli 2>/dev/null || true
             sleep 2
             
             echo "Очистка логов..."
@@ -1200,9 +1203,15 @@ stop_nodes() {
                 echo "Docker не отвечает"
             fi
             echo "Лог очищен"
-        '
-        echo "✓ остановлено"
+        '; then
+            echo "✓ остановлено"
+            success_count=$((success_count + 1))
+        else
+            echo "✗ ошибка остановки"
+            failed_count=$((failed_count + 1))
+        fi
     done
+    echo "Итог: остановлено $success_count, ошибок $failed_count"
     read -p "Нажми Enter..."
 }
 
