@@ -3,7 +3,7 @@ set -e
 
 # Глобальная переменная для префикса контейнеров
 CONTAINER_PREFIX="node"
-SCRIPT_VERSION="2026-02-11.2"
+SCRIPT_VERSION="2026-02-11.3"
 # Файл для хранения учетных данных
 CREDENTIALS_FILE="/root/.optimai_credentials"
 PROXY_SETTINGS_FILE="/root/.optimai_proxy"
@@ -638,6 +638,52 @@ setup_docker() {
         echo ""
         echo "--- $container ---"
 
+        desired_kernel_modules="overlay,br_netfilter,ip_tables,iptable_nat,xt_conntrack"
+        desired_raw_lxc="lxc.apparmor.profile=unconfined
+lxc.mount.auto=proc:rw sys:rw cgroup:rw
+lxc.cgroup.devices.allow=a
+lxc.cap.drop="
+        needs_restart=0
+
+        for cfg in \
+            "security.privileged=true" \
+            "security.nesting=true" \
+            "security.syscalls.intercept.mknod=true" \
+            "security.syscalls.intercept.setxattr=true" \
+            "security.syscalls.intercept.sysctl=true"; do
+            key="${cfg%%=*}"
+            val="${cfg#*=}"
+            current="$(lxc config get "$container" "$key" 2>/dev/null || true)"
+            if [ "$current" != "$val" ]; then
+                lxc config set "$container" "$key" "$val" >/dev/null 2>&1 || true
+                needs_restart=1
+            fi
+        done
+
+        current_kernel_modules="$(lxc config get "$container" linux.kernel_modules 2>/dev/null || true)"
+        if [ "$current_kernel_modules" != "$desired_kernel_modules" ]; then
+            lxc config set "$container" linux.kernel_modules "$desired_kernel_modules" >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        current_raw_lxc="$(lxc config get "$container" raw.lxc 2>/dev/null || true)"
+        if [ "$current_raw_lxc" != "$desired_raw_lxc" ]; then
+            lxc config set "$container" raw.lxc "$desired_raw_lxc" >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        proc_limit="$(lxc config get "$container" limits.processes 2>/dev/null || true)"
+        if ! [[ "$proc_limit" =~ ^[0-9]+$ ]] || [ "$proc_limit" -lt 8192 ]; then
+            lxc config set "$container" limits.processes 8192 >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        if [ "$needs_restart" -eq 1 ]; then
+            echo "→ Применены LXD-параметры для Docker, перезапускаем $container..."
+            lxc restart "$container" >/dev/null 2>&1 || true
+            sleep 8
+        fi
+
         # Проверка: Docker уже установлен и совместимый storage driver активен
         DOCKER_DRIVER=$(lxc exec "$container" -- bash -c '
             if command -v docker >/dev/null 2>&1; then
@@ -648,10 +694,14 @@ setup_docker() {
             fi
         ' 2>/dev/null || true)
 
-        if [ "$DOCKER_DRIVER" = "overlay2" ] || [ "$DOCKER_DRIVER" = "fuse-overlayfs" ] || [ "$DOCKER_DRIVER" = "vfs" ]; then
+        # Важно: пропускаем только overlay2.
+        # Если сейчас fuse-overlayfs/vfs — пытаемся мигрировать на overlay2.
+        if [ "$DOCKER_DRIVER" = "overlay2" ]; then
             echo "✓ Docker уже установлен (storage-driver: $DOCKER_DRIVER), пропускаем"
             configured_count=$((configured_count + 1))
             continue
+        elif [ "$DOCKER_DRIVER" = "fuse-overlayfs" ] || [ "$DOCKER_DRIVER" = "vfs" ]; then
+            echo "→ Обнаружен storage-driver: $DOCKER_DRIVER, пробуем миграцию на overlay2"
         fi
 
         if ! lxc exec "$container" -- bash -c 'ip -4 route show default | grep -q "^default"'; then
