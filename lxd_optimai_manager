@@ -501,10 +501,10 @@ install_lxd() {
         # Настройки для запуска Docker внутри (ФИКС синтаксиса)
         lxc config set "$name" security.privileged true
         lxc config set "$name" security.nesting true
-		#lxc config set "$name" security.syscalls.intercept.sysctl true   # <- добавляем!
+        lxc config set "$name" security.syscalls.intercept.sysctl true
         lxc config set "$name" security.syscalls.intercept.mknod true
-        #lxc config set "$name" security.syscalls.intercept.setxattr true
-        lxc config set "$name" limits.processes 1000
+        lxc config set "$name" security.syscalls.intercept.setxattr true
+        lxc config set "$name" limits.processes 4096
 
         # Привязка сети
         lxc network attach lxdbr0 "$name" eth0 2>/dev/null || true
@@ -1091,6 +1091,34 @@ start_nodes() {
         echo "[$i] Запуск ${node_name}..."
         lxc list -c n --format csv | grep -q "^${node_name}$" || { echo "нет"; continue; }
 
+        needs_restart=0
+        for cfg in \
+            "security.privileged=true" \
+            "security.nesting=true" \
+            "security.syscalls.intercept.mknod=true" \
+            "security.syscalls.intercept.setxattr=true" \
+            "security.syscalls.intercept.sysctl=true"; do
+            key="${cfg%%=*}"
+            val="${cfg#*=}"
+            current="$(lxc config get "$node_name" "$key" 2>/dev/null || true)"
+            if [ "$current" != "$val" ]; then
+                lxc config set "$node_name" "$key" "$val" >/dev/null 2>&1 || true
+                needs_restart=1
+            fi
+        done
+
+        proc_limit="$(lxc config get "$node_name" limits.processes 2>/dev/null || true)"
+        if ! [[ "$proc_limit" =~ ^[0-9]+$ ]] || [ "$proc_limit" -lt 4096 ]; then
+            lxc config set "$node_name" limits.processes 4096 >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        if [ "$needs_restart" -eq 1 ]; then
+            echo "[DEBUG] Применены docker-совместимые параметры LXD, перезапуск ${node_name}..."
+            lxc restart "$node_name" >/dev/null 2>&1 || true
+            sleep 8
+        fi
+
         if lxc exec "$node_name" -- bash << 'SCRIPT'
 set -e
 mkdir -p /var/log/optimai
@@ -1120,6 +1148,8 @@ if ! timeout 20 docker ps -a >/dev/null 2>&1; then
     exit 1
 fi
 
+sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
+
 echo "[DEBUG] Удаляем старый crawler контейнер (если есть)..."
 timeout 20 docker rm -f optimai_crawl4ai_0_7_3 >/dev/null 2>&1 || true
 
@@ -1130,6 +1160,7 @@ Description=OptimAI node service
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
@@ -1140,7 +1171,6 @@ ExecStartPre=/bin/bash -lc 'timeout 20 docker rm -f optimai_crawl4ai_0_7_3 >/dev
 ExecStart=/usr/local/bin/optimai-cli node start
 Restart=always
 RestartSec=25
-StartLimitIntervalSec=0
 TimeoutStartSec=180
 StandardOutput=append:/var/log/optimai/node.log
 StandardError=append:/var/log/optimai/node.log
