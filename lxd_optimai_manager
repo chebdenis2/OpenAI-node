@@ -1073,11 +1073,18 @@ start_nodes() {
 
     start=$(echo $result | cut -d' ' -f1)
     end=$(echo $result | cut -d' ' -f2)
+    total_nodes=$((end - start + 1))
+    inter_node_delay=2
+    if [ "$total_nodes" -gt 10 ]; then
+        inter_node_delay=8
+    fi
+
     if [ "$start" -eq "$end" ]; then
         echo "Запуск ${CONTAINER_PREFIX}${start}..."
     else
         echo "Запуск нод с ${CONTAINER_PREFIX}${start} по ${CONTAINER_PREFIX}${end}..."
     fi
+    echo "Интервал запуска между нодами: ${inter_node_delay}с"
 
     for i in $(seq $start $end); do
         node_name="${CONTAINER_PREFIX}${i}"
@@ -1113,6 +1120,9 @@ if ! timeout 20 docker ps -a >/dev/null 2>&1; then
     exit 1
 fi
 
+echo "[DEBUG] Удаляем старый crawler контейнер (если есть)..."
+timeout 20 docker rm -f optimai_crawl4ai_0_7_3 >/dev/null 2>&1 || true
+
 echo "[DEBUG] Настройка systemd сервиса optimai-node..."
 cat > /etc/systemd/system/optimai-node.service <<'UNIT'
 [Unit]
@@ -1125,10 +1135,13 @@ Requires=docker.service
 Type=simple
 WorkingDirectory=/root
 EnvironmentFile=-/etc/environment.d/90-optimai-proxy.conf
+ExecStartPre=/bin/bash -lc 'timeout 20 docker ps -a >/dev/null 2>&1'
+ExecStartPre=/bin/bash -lc 'timeout 20 docker rm -f optimai_crawl4ai_0_7_3 >/dev/null 2>&1 || true'
 ExecStart=/usr/local/bin/optimai-cli node start
 Restart=always
-RestartSec=15
+RestartSec=25
 StartLimitIntervalSec=0
+TimeoutStartSec=180
 StandardOutput=append:/var/log/optimai/node.log
 StandardError=append:/var/log/optimai/node.log
 
@@ -1157,7 +1170,7 @@ SCRIPT
         fi
 
         echo ""
-        sleep 2
+        sleep "$inter_node_delay"
     done
 
     echo "✓ Запуск завершен"
