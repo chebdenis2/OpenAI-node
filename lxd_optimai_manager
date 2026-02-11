@@ -66,6 +66,20 @@ ensure_host_ipv4_forwarding() {
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/99-lxd-forwarding.conf
 }
 
+ensure_host_lxd_docker_modules() {
+    modprobe overlay >/dev/null 2>&1 || true
+    modprobe br_netfilter >/dev/null 2>&1 || true
+
+    mkdir -p /etc/modules-load.d
+    if [ -f /etc/modules-load.d/lxd-docker.conf ]; then
+        sed -i '/^overlay$/d;/^br_netfilter$/d' /etc/modules-load.d/lxd-docker.conf
+    fi
+    {
+        echo "overlay"
+        echo "br_netfilter"
+    } >> /etc/modules-load.d/lxd-docker.conf
+}
+
 ensure_lxdbr0_network_health() {
     local candidate_subnet
     local ipv4_address ipv4_nat ipv4_dhcp ipv6_address
@@ -408,6 +422,7 @@ install_lxd() {
     fi
 
     echo "=== Проверка параметров lxdbr0 и host forwarding ==="
+    ensure_host_lxd_docker_modules
     ensure_host_ipv4_forwarding
     ensure_lxdbr0_network_health || {
         echo "❌ lxdbr0 настроен некорректно. Исправьте сеть и повторите пункт 2."
@@ -504,6 +519,11 @@ install_lxd() {
         lxc config set "$name" security.syscalls.intercept.sysctl true
         lxc config set "$name" security.syscalls.intercept.mknod true
         lxc config set "$name" security.syscalls.intercept.setxattr true
+        lxc config set "$name" linux.kernel_modules "overlay,br_netfilter,ip_tables,iptable_nat,xt_conntrack"
+        lxc config set "$name" raw.lxc "lxc.apparmor.profile=unconfined
+lxc.mount.auto=proc:rw sys:rw cgroup:rw
+lxc.cgroup.devices.allow=a
+lxc.cap.drop="
         lxc config set "$name" limits.processes 8192
 
         # Привязка сети
@@ -597,6 +617,7 @@ setup_docker() {
     [ -z "$CONTAINERS" ] && { echo "❌ Контейнеры не найдены"; read -p "Enter..."; return; }
 
     echo "=== Проверка сети LXD перед установкой Docker ==="
+    ensure_host_lxd_docker_modules
     ensure_host_ipv4_forwarding
     ensure_lxdbr0_network_health || {
         echo "❌ Сеть lxdbr0 не готова. Сначала повтори пункт 2."
@@ -621,13 +642,13 @@ setup_docker() {
         DOCKER_DRIVER=$(lxc exec "$container" -- bash -c '
             if command -v docker >/dev/null 2>&1; then
                 DRIVER=$(docker info --format "{{.Driver}}" 2>/dev/null || echo "none")
-                if [ "$DRIVER" = "fuse-overlayfs" ] || [ "$DRIVER" = "vfs" ]; then
+                if [ "$DRIVER" = "overlay2" ] || [ "$DRIVER" = "fuse-overlayfs" ] || [ "$DRIVER" = "vfs" ]; then
                     echo "$DRIVER"
                 fi
             fi
         ' 2>/dev/null || true)
 
-        if [ "$DOCKER_DRIVER" = "fuse-overlayfs" ] || [ "$DOCKER_DRIVER" = "vfs" ]; then
+        if [ "$DOCKER_DRIVER" = "overlay2" ] || [ "$DOCKER_DRIVER" = "fuse-overlayfs" ] || [ "$DOCKER_DRIVER" = "vfs" ]; then
             echo "✓ Docker уже установлен (storage-driver: $DOCKER_DRIVER), пропускаем"
             configured_count=$((configured_count + 1))
             continue
@@ -748,39 +769,47 @@ if ls /etc/apt/sources.list.d/*.list >/dev/null 2>&1; then
         /etc/apt/sources.list.d/*.list 2>/dev/null || true
 fi
 
-echo "[3/6] Установка fuse-overlayfs (fallback: vfs)..."
-STORAGE_DRIVER="vfs"
-MAX_RETRIES=3
-for attempt in $(seq 1 $MAX_RETRIES); do
-    echo "Попытка $attempt: установка fuse-overlayfs..."
-    if apt-get update -qq -o Acquire::ForceIPv4=true && apt-get install -y -qq fuse-overlayfs; then
-        STORAGE_DRIVER="fuse-overlayfs"
-        echo "✓ fuse-overlayfs установлен"
-        break
-    else
-        if [ -n "$ACTIVE_PROXY_URL" ]; then
-            echo "⚠ Прокси нестабилен, переключаемся на прямое соединение и повторяем..."
-            ACTIVE_PROXY_URL=""
-            apply_proxy_profile
-            continue
-        fi
-        echo "⚠ Попытка $attempt не удалась"
-        if [ "$attempt" -lt "$MAX_RETRIES" ]; then
-            echo "Ждем 5 секунд перед повтором..."
-            sleep 5
-        fi
-    fi
-done
+echo "[3/6] Настройка storage-driver (overlay2 preferred)..."
+STORAGE_DRIVER="overlay2"
+if ! grep -qw overlay /proc/filesystems 2>/dev/null; then
+    STORAGE_DRIVER="fuse-overlayfs"
+fi
 
-if [ "$STORAGE_DRIVER" = "vfs" ]; then
-    echo "⚠ fuse-overlayfs недоступен, используем vfs (медленнее, но совместимо)"
+if [ "$STORAGE_DRIVER" = "fuse-overlayfs" ]; then
+    MAX_RETRIES=3
+    for attempt in $(seq 1 $MAX_RETRIES); do
+        echo "Попытка $attempt: установка fuse-overlayfs..."
+        if apt-get update -qq -o Acquire::ForceIPv4=true && apt-get install -y -qq fuse-overlayfs; then
+            echo "✓ fuse-overlayfs установлен"
+            break
+        else
+            if [ -n "$ACTIVE_PROXY_URL" ]; then
+                echo "⚠ Прокси нестабилен, переключаемся на прямое соединение и повторяем..."
+                ACTIVE_PROXY_URL=""
+                apply_proxy_profile
+                continue
+            fi
+            echo "⚠ Попытка $attempt не удалась"
+            if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+                echo "Ждем 5 секунд перед повтором..."
+                sleep 5
+            fi
+        fi
+    done
+else
+    echo "✓ Будет использован overlay2"
 fi
 
 # [4/6] Настройка daemon.json
 mkdir -p /etc/docker
 cat > /etc/docker/daemon.json <<JSON
 {
-  "storage-driver": "${STORAGE_DRIVER}"
+  "storage-driver": "${STORAGE_DRIVER}",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
 }
 JSON
 
@@ -865,7 +894,7 @@ EOF
     done
 
     echo ""
-    echo "✅ Docker настройка завершена: успешно $configured_count, с ошибками $failed_count"
+    echo "✅ Docker настройка завершена: успешно $configured_count, с ошибками $failed_count (driver: overlay2/fuse-overlayfs/vfs)"
     read -p "Нажми Enter..."
 }
 
@@ -1098,6 +1127,11 @@ start_nodes() {
         lxc list -c n --format csv | grep -q "^${node_name}$" || { echo "нет"; continue; }
 
         needs_restart=0
+        desired_kernel_modules="overlay,br_netfilter,ip_tables,iptable_nat,xt_conntrack"
+        desired_raw_lxc="lxc.apparmor.profile=unconfined
+lxc.mount.auto=proc:rw sys:rw cgroup:rw
+lxc.cgroup.devices.allow=a
+lxc.cap.drop="
         for cfg in \
             "security.privileged=true" \
             "security.nesting=true" \
@@ -1112,6 +1146,18 @@ start_nodes() {
                 needs_restart=1
             fi
         done
+
+        current_kernel_modules="$(lxc config get "$node_name" linux.kernel_modules 2>/dev/null || true)"
+        if [ "$current_kernel_modules" != "$desired_kernel_modules" ]; then
+            lxc config set "$node_name" linux.kernel_modules "$desired_kernel_modules" >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        current_raw_lxc="$(lxc config get "$node_name" raw.lxc 2>/dev/null || true)"
+        if [ "$current_raw_lxc" != "$desired_raw_lxc" ]; then
+            lxc config set "$node_name" raw.lxc "$desired_raw_lxc" >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
 
         proc_limit="$(lxc config get "$node_name" limits.processes 2>/dev/null || true)"
         if ! [[ "$proc_limit" =~ ^[0-9]+$ ]] || [ "$proc_limit" -lt 8192 ]; then
@@ -1168,6 +1214,25 @@ if ! timeout 20 docker ps -a >/dev/null 2>&1; then
     echo "✗ ОШИБКА: Docker не отвечает (docker ps timeout)"
     systemctl status docker --no-pager -l | tail -40 || true
     exit 1
+fi
+
+DRIVER=$(docker info --format "{{.Driver}}" 2>/dev/null || echo "unknown")
+if [ "$DRIVER" != "overlay2" ] && grep -qw overlay /proc/filesystems 2>/dev/null; then
+    echo "[DEBUG] Переключаем Docker storage-driver на overlay2..."
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json <<JSON
+{
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+JSON
+    systemctl restart docker || true
+    sleep 5
+    timeout 20 docker ps -a >/dev/null 2>&1 || true
 fi
 
 sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
