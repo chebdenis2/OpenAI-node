@@ -504,7 +504,7 @@ install_lxd() {
         lxc config set "$name" security.syscalls.intercept.sysctl true
         lxc config set "$name" security.syscalls.intercept.mknod true
         lxc config set "$name" security.syscalls.intercept.setxattr true
-        lxc config set "$name" limits.processes 4096
+        lxc config set "$name" limits.processes 8192
 
         # Привязка сети
         lxc network attach lxdbr0 "$name" eth0 2>/dev/null || true
@@ -807,8 +807,8 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 # [6/6] Запуск Docker
+mkdir -p /etc/systemd/system/docker.service.d
 if [ -n "$ACTIVE_PROXY_URL" ]; then
-    mkdir -p /etc/systemd/system/docker.service.d
     cat > /etc/systemd/system/docker.service.d/http-proxy.conf <<DOCKER_PROXY
 [Service]
 Environment="HTTP_PROXY=${ACTIVE_PROXY_URL}"
@@ -818,6 +818,12 @@ DOCKER_PROXY
 else
     rm -f /etc/systemd/system/docker.service.d/http-proxy.conf
 fi
+cat > /etc/systemd/system/docker.service.d/optimai-limits.conf <<DOCKER_LIMITS
+[Service]
+TasksMax=infinity
+LimitNOFILE=1048576
+LimitNPROC=1048576
+DOCKER_LIMITS
 systemctl daemon-reload >/dev/null 2>&1 || true
 systemctl enable docker
 systemctl restart docker
@@ -1108,8 +1114,8 @@ start_nodes() {
         done
 
         proc_limit="$(lxc config get "$node_name" limits.processes 2>/dev/null || true)"
-        if ! [[ "$proc_limit" =~ ^[0-9]+$ ]] || [ "$proc_limit" -lt 4096 ]; then
-            lxc config set "$node_name" limits.processes 4096 >/dev/null 2>&1 || true
+        if ! [[ "$proc_limit" =~ ^[0-9]+$ ]] || [ "$proc_limit" -lt 8192 ]; then
+            lxc config set "$node_name" limits.processes 8192 >/dev/null 2>&1 || true
             needs_restart=1
         fi
 
@@ -1134,6 +1140,22 @@ if ! systemctl is-active docker >/dev/null 2>&1; then
     echo "[DEBUG] Запуск Docker..."
     systemctl start docker || true
     sleep 3
+fi
+
+mkdir -p /etc/systemd/system/docker.service.d
+cat > /etc/systemd/system/docker.service.d/optimai-limits.conf <<DOCKER_LIMITS
+[Service]
+TasksMax=infinity
+LimitNOFILE=1048576
+LimitNPROC=1048576
+DOCKER_LIMITS
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+docker_tasks_max="$(systemctl show docker --property=TasksMax --value 2>/dev/null || true)"
+if [ "$docker_tasks_max" != "infinity" ] && [ "$docker_tasks_max" != "18446744073709551615" ]; then
+    echo "[DEBUG] Применяем лимиты docker.service (TasksMax)..."
+    systemctl restart docker || true
+    sleep 5
 fi
 
 if ! timeout 20 docker ps -a >/dev/null 2>&1; then
@@ -1166,6 +1188,7 @@ StartLimitIntervalSec=0
 Type=simple
 WorkingDirectory=/root
 EnvironmentFile=-/etc/environment.d/90-optimai-proxy.conf
+TasksMax=infinity
 ExecStartPre=/bin/bash -lc 'timeout 20 docker ps -a >/dev/null 2>&1'
 ExecStartPre=/bin/bash -lc 'timeout 20 docker rm -f optimai_crawl4ai_0_7_3 >/dev/null 2>&1 || true'
 ExecStart=/usr/local/bin/optimai-cli node start
