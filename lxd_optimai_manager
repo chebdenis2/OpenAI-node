@@ -3,7 +3,7 @@ set -e
 
 # Глобальная переменная для префикса контейнеров
 CONTAINER_PREFIX="node"
-SCRIPT_VERSION="2026-02-10.1"
+SCRIPT_VERSION="2026-02-11.2"
 # Файл для хранения учетных данных
 CREDENTIALS_FILE="/root/.optimai_credentials"
 PROXY_SETTINGS_FILE="/root/.optimai_proxy"
@@ -1189,6 +1189,8 @@ Type=simple
 WorkingDirectory=/root
 EnvironmentFile=-/etc/environment.d/90-optimai-proxy.conf
 TasksMax=infinity
+LimitNOFILE=1048576
+LimitNPROC=1048576
 ExecStartPre=/bin/bash -lc 'timeout 20 docker ps -a >/dev/null 2>&1'
 ExecStartPre=/bin/bash -lc 'timeout 20 docker rm -f optimai_crawl4ai_0_7_3 >/dev/null 2>&1 || true'
 ExecStart=/usr/local/bin/optimai-cli node start
