@@ -3,7 +3,7 @@ set -e
 
 # Глобальная переменная для префикса контейнеров
 CONTAINER_PREFIX="node"
-SCRIPT_VERSION="2026-02-11.3"
+SCRIPT_VERSION="2026-02-11.4"
 # Файл для хранения учетных данных
 CREDENTIALS_FILE="/root/.optimai_credentials"
 PROXY_SETTINGS_FILE="/root/.optimai_proxy"
@@ -613,8 +613,30 @@ setup_docker() {
     echo "  [3/3] НАСТРОЙКА DOCKER (FIXED)"
     echo "=========================================="
 
-    CONTAINERS=$(lxc list -c n --format csv | grep "^${CONTAINER_PREFIX}")
-    [ -z "$CONTAINERS" ] && { echo "❌ Контейнеры не найдены"; read -p "Enter..."; return; }
+    local max start end result range
+    local existing_containers container_name
+
+    max=$(get_max_container)
+    echo "Какие контейнеры настроить Docker? (5, 1-10, Enter=все 1-$max)"
+    read -r range
+    result=$(parse_range "$range")
+    [ $? -ne 0 ] && { echo "✗ $result"; read -p "Enter..."; return; }
+
+    start=$(echo "$result" | cut -d' ' -f1)
+    end=$(echo "$result" | cut -d' ' -f2)
+
+    existing_containers=$(lxc list -c n --format csv)
+    CONTAINERS=""
+    for i in $(seq "$start" "$end"); do
+        container_name="${CONTAINER_PREFIX}${i}"
+        if echo "$existing_containers" | grep -q "^${container_name}$"; then
+            CONTAINERS="$CONTAINERS $container_name"
+        else
+            echo "⚠️ ${container_name}: контейнер не найден, пропуск"
+        fi
+    done
+    CONTAINERS=$(echo "$CONTAINERS" | xargs)
+    [ -z "$CONTAINERS" ] && { echo "❌ Подходящие контейнеры не найдены"; read -p "Enter..."; return; }
 
     echo "=== Проверка сети LXD перед установкой Docker ==="
     ensure_host_lxd_docker_modules
