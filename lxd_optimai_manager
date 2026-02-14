@@ -1388,6 +1388,15 @@ else
         timeout 20 docker logs --tail 80 "$crawler" 2>/dev/null || true
     done
 
+    if tail -n 120 /var/log/optimai/node.log 2>/dev/null | grep -Eqi 'not authenticated|auth login'; then
+        echo "✗ Обнаружена ошибка авторизации OptimAI CLI на этой ноде."
+        echo "  Выполни пункт 5 (Логин OptimAI), затем снова пункт 6 (Запустить ноды)."
+        systemctl stop optimai-node >/dev/null 2>&1 || true
+        systemctl disable optimai-node >/dev/null 2>&1 || true
+        systemctl reset-failed optimai-node >/dev/null 2>&1 || true
+        exit 42
+    fi
+
     echo "[DEBUG] Пробуем recovery: reset-failed + restart docker + restart optimai-node..."
     systemctl stop optimai-node >/dev/null 2>&1 || true
     systemctl reset-failed optimai-node >/dev/null 2>&1 || true
@@ -1413,7 +1422,11 @@ SCRIPT
             echo "✓ ${node_name} запущен"
         else
             rc=$?
-            echo "✗ Ошибка запуска ${node_name} (код: $rc)"
+            if [ "$rc" -eq 42 ]; then
+                echo "✗ Ошибка запуска ${node_name}: OptimAI CLI не авторизован (сначала пункт 5, потом 6)"
+            else
+                echo "✗ Ошибка запуска ${node_name} (код: $rc)"
+            fi
         fi
 
         echo ""
