@@ -1326,8 +1326,14 @@ fi
 
 sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
 
-echo "[DEBUG] Удаляем старый crawler контейнер (если есть)..."
-timeout 20 docker rm -f optimai_crawl4ai_0_7_3 >/dev/null 2>&1 || true
+echo "[DEBUG] Останавливаем старые процессы optimai-cli (если есть)..."
+pkill -9 -x optimai-cli >/dev/null 2>&1 || true
+sleep 1
+
+echo "[DEBUG] Удаляем старые crawler контейнеры (если есть)..."
+for stale_crawler in $(timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^optimai_crawl4ai(_|$)' || true); do
+    timeout 20 docker rm -f "$stale_crawler" >/dev/null 2>&1 || true
+done
 
 echo "[DEBUG] Настройка systemd сервиса optimai-node..."
 cat > /etc/systemd/system/optimai-node.service <<'UNIT'
@@ -1336,7 +1342,8 @@ Description=OptimAI node service
 After=network-online.target docker.service
 Wants=network-online.target
 Requires=docker.service
-StartLimitIntervalSec=0
+StartLimitIntervalSec=600
+StartLimitBurst=6
 
 [Service]
 Type=simple
@@ -1345,10 +1352,11 @@ EnvironmentFile=-/etc/environment.d/90-optimai-proxy.conf
 TasksMax=infinity
 LimitNOFILE=1048576
 LimitNPROC=1048576
+ExecStartPre=/bin/bash -lc 'pkill -9 -x optimai-cli >/dev/null 2>&1 || true'
 ExecStartPre=/bin/bash -lc 'timeout 20 docker ps -a >/dev/null 2>&1'
-ExecStartPre=/bin/bash -lc 'timeout 20 docker rm -f optimai_crawl4ai_0_7_3 >/dev/null 2>&1 || true'
+ExecStartPre=/bin/bash -lc 'for c in $(timeout 20 docker ps -a --format "{{.Names}}" 2>/dev/null | grep -E "^optimai_crawl4ai(_|$)" || true); do timeout 20 docker rm -f "$c" >/dev/null 2>&1 || true; done'
 ExecStart=/usr/local/bin/optimai-cli node start
-Restart=always
+Restart=on-failure
 RestartSec=25
 TimeoutStartSec=180
 StandardOutput=append:/var/log/optimai/node.log
@@ -1360,6 +1368,7 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable optimai-node >/dev/null 2>&1 || true
+systemctl stop optimai-node >/dev/null 2>&1 || true
 systemctl reset-failed optimai-node >/dev/null 2>&1 || true
 systemctl restart optimai-node
 sleep 5
@@ -1373,13 +1382,18 @@ else
     tail -n 80 /var/log/optimai/node.log 2>/dev/null || echo "node.log пуст или отсутствует"
     echo "----- docker ps -a -----"
     timeout 20 docker ps -a || true
-    echo "----- docker logs optimai_crawl4ai_0_7_3 -----"
-    timeout 20 docker logs --tail 80 optimai_crawl4ai_0_7_3 2>/dev/null || true
+    echo "----- docker logs optimai_crawl4ai* -----"
+    for crawler in $(timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^optimai_crawl4ai(_|$)' || true); do
+        echo ">>> $crawler"
+        timeout 20 docker logs --tail 80 "$crawler" 2>/dev/null || true
+    done
 
     echo "[DEBUG] Пробуем recovery: reset-failed + restart docker + restart optimai-node..."
     systemctl stop optimai-node >/dev/null 2>&1 || true
     systemctl reset-failed optimai-node >/dev/null 2>&1 || true
-    timeout 20 docker rm -f optimai_crawl4ai_0_7_3 >/dev/null 2>&1 || true
+    for stale_crawler in $(timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^optimai_crawl4ai(_|$)' || true); do
+        timeout 20 docker rm -f "$stale_crawler" >/dev/null 2>&1 || true
+    done
     systemctl restart docker >/dev/null 2>&1 || true
     sleep 5
     systemctl restart optimai-node >/dev/null 2>&1 || true
@@ -1433,8 +1447,10 @@ stop_nodes() {
             systemctl reset-failed optimai-node 2>/dev/null || true
 
             echo "Останавливаем Docker контейнеры..."
-            timeout 20 docker stop optimai_crawl4ai_0_7_3 2>/dev/null || true
-            timeout 20 docker rm optimai_crawl4ai_0_7_3 2>/dev/null || true
+            for stale_crawler in $(timeout 20 docker ps -a --format "{{.Names}}" 2>/dev/null | grep -E "^optimai_crawl4ai(_|$)" || true); do
+                timeout 20 docker stop "$stale_crawler" 2>/dev/null || true
+                timeout 20 docker rm "$stale_crawler" 2>/dev/null || true
+            done
             timeout 30 docker system prune -f -q 2>/dev/null || true
             
             echo "Останавливаем optimai-cli..."
