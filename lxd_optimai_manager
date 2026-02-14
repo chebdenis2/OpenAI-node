@@ -3,8 +3,22 @@ set -e
 
 # Глобальная переменная для префикса контейнеров
 CONTAINER_PREFIX="node"
+SCRIPT_VERSION="2026-02-11.6"
 # Файл для хранения учетных данных
 CREDENTIALS_FILE="/root/.optimai_credentials"
+PROXY_SETTINGS_FILE="/root/.optimai_proxy"
+DEFAULT_NO_PROXY="localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,*.local"
+GLOBAL_PROXY_URL=""
+GLOBAL_NO_PROXY="$DEFAULT_NO_PROXY"
+LXD_SUBNET_CANDIDATES=(
+    "10.10.10.1/24"
+    "10.20.20.1/24"
+    "10.30.30.1/24"
+    "10.40.40.1/24"
+    "10.250.250.1/24"
+    "172.31.250.1/24"
+    "192.168.250.1/24"
+)
 
 # Проверка root прав
 if [[ $EUID -ne 0 ]]; then
@@ -15,6 +29,341 @@ fi
 # ============================================
 # БЛОК 1: УСТАНОВКА И НАСТРОЙКА LXD
 # ============================================
+
+create_lxdbr0_network() {
+    local candidate_subnet
+
+    echo "→ Пробуем авто-конфигурацию сети..."
+    if lxc network create lxdbr0 ipv4.nat=true ipv6.address=none; then
+        return 0
+    fi
+
+    echo "⚠️ Авто-конфигурация не удалась. Пробуем фиксированные подсети..."
+    for candidate_subnet in "${LXD_SUBNET_CANDIDATES[@]}"; do
+        echo "→ Пробуем подсеть ${candidate_subnet}"
+        if lxc network create lxdbr0 ipv4.address="${candidate_subnet}" ipv4.nat=true ipv6.address=none >/dev/null 2>&1; then
+            echo "✓ Выбрана подсеть ${candidate_subnet}"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+ensure_host_ipv4_forwarding() {
+    local current_forward
+    current_forward=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
+
+    if [ "$current_forward" != "1" ]; then
+        echo "⚠️ net.ipv4.ip_forward выключен. Включаем..."
+        sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    fi
+
+    mkdir -p /etc/sysctl.d
+    if [ -f /etc/sysctl.d/99-lxd-forwarding.conf ]; then
+        sed -i '/^net\.ipv4\.ip_forward=/d' /etc/sysctl.d/99-lxd-forwarding.conf
+    fi
+    echo "net.ipv4.ip_forward=1" >> /etc/sysctl.d/99-lxd-forwarding.conf
+}
+
+ensure_host_lxd_docker_modules() {
+    modprobe overlay >/dev/null 2>&1 || true
+    modprobe br_netfilter >/dev/null 2>&1 || true
+
+    mkdir -p /etc/modules-load.d
+    if [ -f /etc/modules-load.d/lxd-docker.conf ]; then
+        sed -i '/^overlay$/d;/^br_netfilter$/d' /etc/modules-load.d/lxd-docker.conf
+    fi
+    {
+        echo "overlay"
+        echo "br_netfilter"
+    } >> /etc/modules-load.d/lxd-docker.conf
+}
+
+lxc_set_instance_config_safe() {
+    local instance_name="$1"
+    local config_key="$2"
+    local config_value="$3"
+    local err
+
+    err=$(lxc config set "$instance_name" "$config_key" "$config_value" 2>&1) && return 0
+
+    if echo "$err" | grep -qi "Unknown configuration key"; then
+        echo "⚠️ ${instance_name}: ключ '${config_key}' не поддерживается этой версией LXD, пропуск"
+        return 0
+    fi
+
+    echo "⚠️ ${instance_name}: не удалось установить '${config_key}' (${err})"
+    return 1
+}
+
+ensure_lxdbr0_network_health() {
+    local candidate_subnet
+    local ipv4_address ipv4_nat ipv4_dhcp ipv6_address
+
+    if ! lxc network show lxdbr0 >/dev/null 2>&1; then
+        create_lxdbr0_network || return 1
+    fi
+
+    ipv4_address=$(lxc network get lxdbr0 ipv4.address 2>/dev/null || true)
+    ipv4_nat=$(lxc network get lxdbr0 ipv4.nat 2>/dev/null || true)
+    ipv4_dhcp=$(lxc network get lxdbr0 ipv4.dhcp 2>/dev/null || true)
+    ipv6_address=$(lxc network get lxdbr0 ipv6.address 2>/dev/null || true)
+
+    if [ -z "$ipv4_address" ] || [ "$ipv4_address" = "none" ]; then
+        echo "⚠️ Для lxdbr0 не задан ipv4.address. Исправляем..."
+        for candidate_subnet in "${LXD_SUBNET_CANDIDATES[@]}"; do
+            if lxc network set lxdbr0 ipv4.address="$candidate_subnet" >/dev/null 2>&1; then
+                ipv4_address="$candidate_subnet"
+                echo "✓ Установлен ipv4.address=${candidate_subnet}"
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$ipv4_address" ] || [ "$ipv4_address" = "none" ]; then
+        echo "❌ Не удалось установить ipv4.address для lxdbr0"
+        return 1
+    fi
+
+    if [ "$ipv4_nat" != "true" ]; then
+        echo "→ Включаем ipv4.nat=true для lxdbr0"
+        lxc network set lxdbr0 ipv4.nat true >/dev/null 2>&1 || true
+    fi
+
+    if [ "$ipv4_dhcp" != "true" ]; then
+        echo "→ Включаем ipv4.dhcp=true для lxdbr0"
+        lxc network set lxdbr0 ipv4.dhcp true >/dev/null 2>&1 || true
+    fi
+
+    if [ "$ipv6_address" != "none" ]; then
+        lxc network set lxdbr0 ipv6.address none >/dev/null 2>&1 || true
+    fi
+
+    echo "✓ lxdbr0: ipv4.address=$(lxc network get lxdbr0 ipv4.address 2>/dev/null || echo "unknown"), ipv4.nat=$(lxc network get lxdbr0 ipv4.nat 2>/dev/null || echo "unknown"), ipv4.dhcp=$(lxc network get lxdbr0 ipv4.dhcp 2>/dev/null || echo "unknown")"
+    return 0
+}
+
+get_lxdbr0_subnet_cidr() {
+    local bridge_addr
+    bridge_addr=$(lxc network get lxdbr0 ipv4.address 2>/dev/null || true)
+    if [ -z "$bridge_addr" ] || [ "$bridge_addr" = "none" ]; then
+        return 1
+    fi
+
+    python3 - "$bridge_addr" <<'PY'
+import ipaddress
+import sys
+
+try:
+    print(ipaddress.ip_interface(sys.argv[1]).network.with_prefixlen)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+ensure_manual_lxd_nat_rules() {
+    local uplink_if lxd_subnet
+
+    uplink_if=$(ip -4 route show default 2>/dev/null | awk 'NR==1 {print $5}')
+    lxd_subnet=$(get_lxdbr0_subnet_cidr 2>/dev/null || true)
+
+    if [ -z "$uplink_if" ] || [ -z "$lxd_subnet" ]; then
+        return 1
+    fi
+
+    if command -v iptables >/dev/null 2>&1; then
+        iptables -C FORWARD -i lxdbr0 -o "$uplink_if" -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -i lxdbr0 -o "$uplink_if" -j ACCEPT
+        iptables -C FORWARD -i "$uplink_if" -o lxdbr0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+            iptables -I FORWARD 1 -i "$uplink_if" -o lxdbr0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+        iptables -t nat -C POSTROUTING -s "$lxd_subnet" -o "$uplink_if" -j MASQUERADE 2>/dev/null || \
+            iptables -t nat -I POSTROUTING 1 -s "$lxd_subnet" -o "$uplink_if" -j MASQUERADE
+    fi
+
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -C FORWARD -i lxdbr0 -o "$uplink_if" -j ACCEPT 2>/dev/null || \
+            ip6tables -I FORWARD 1 -i lxdbr0 -o "$uplink_if" -j ACCEPT
+        ip6tables -C FORWARD -i "$uplink_if" -o lxdbr0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+            ip6tables -I FORWARD 1 -i "$uplink_if" -o lxdbr0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    fi
+
+    return 0
+}
+
+load_proxy_settings() {
+    GLOBAL_PROXY_URL=""
+    GLOBAL_NO_PROXY="$DEFAULT_NO_PROXY"
+
+    if [ -n "${http_proxy:-}" ]; then
+        GLOBAL_PROXY_URL="${http_proxy}"
+    elif [ -n "${HTTP_PROXY:-}" ]; then
+        GLOBAL_PROXY_URL="${HTTP_PROXY}"
+    elif [ -n "${https_proxy:-}" ]; then
+        GLOBAL_PROXY_URL="${https_proxy}"
+    elif [ -n "${HTTPS_PROXY:-}" ]; then
+        GLOBAL_PROXY_URL="${HTTPS_PROXY}"
+    fi
+
+    if [ -n "${no_proxy:-}" ]; then
+        GLOBAL_NO_PROXY="${no_proxy}"
+    elif [ -n "${NO_PROXY:-}" ]; then
+        GLOBAL_NO_PROXY="${NO_PROXY}"
+    fi
+
+    if [ -f "$PROXY_SETTINGS_FILE" ]; then
+        # shellcheck disable=SC1090
+        source "$PROXY_SETTINGS_FILE"
+        if [ -n "${PROXY_URL:-}" ]; then
+            GLOBAL_PROXY_URL="${PROXY_URL}"
+        fi
+        if [ -n "${PROXY_NO_PROXY:-}" ]; then
+            GLOBAL_NO_PROXY="${PROXY_NO_PROXY}"
+        fi
+    fi
+}
+
+save_proxy_settings() {
+    printf 'PROXY_URL=%q\nPROXY_NO_PROXY=%q\n' "$GLOBAL_PROXY_URL" "$GLOBAL_NO_PROXY" > "$PROXY_SETTINGS_FILE"
+    chmod 600 "$PROXY_SETTINGS_FILE"
+}
+
+prompt_proxy_settings() {
+    local use_proxy proxy_url no_proxy_input
+
+    if [ ! -t 0 ]; then
+        return 1
+    fi
+
+    echo ""
+    echo "=== Настройка прокси для контейнеров ==="
+    echo "Прямой выход в интернет недоступен."
+    read -r -p "Настроить HTTP(S)-прокси? [y/N]: " use_proxy
+    if [[ ! "$use_proxy" =~ ^[Yy]$ ]]; then
+        return 1
+    fi
+
+    read -r -p "Proxy URL (например http://user:pass@host:port): " proxy_url
+    if [ -z "$proxy_url" ]; then
+        echo "❌ Proxy URL пустой"
+        return 1
+    fi
+
+    read -r -p "NO_PROXY [${DEFAULT_NO_PROXY}]: " no_proxy_input
+    GLOBAL_PROXY_URL="$proxy_url"
+    if [ -n "$no_proxy_input" ]; then
+        GLOBAL_NO_PROXY="$no_proxy_input"
+    else
+        GLOBAL_NO_PROXY="$DEFAULT_NO_PROXY"
+    fi
+
+    save_proxy_settings
+    echo "✓ Прокси сохранён в $PROXY_SETTINGS_FILE"
+    return 0
+}
+
+apply_proxy_settings_to_container() {
+    local container="$1"
+    local proxy_url="${2:-$GLOBAL_PROXY_URL}"
+    local no_proxy_value="${3:-$GLOBAL_NO_PROXY}"
+
+    [ -z "$container" ] && return 1
+
+    if [ -n "$proxy_url" ]; then
+        lxc exec "$container" -- bash -s -- "$proxy_url" "$no_proxy_value" <<'EOF'
+set -e
+PROXY_URL="$1"
+NO_PROXY_VALUE="$2"
+
+cat > /etc/apt/apt.conf.d/98optimai-proxy <<APT_PROXY
+Acquire::http::Proxy "${PROXY_URL}";
+Acquire::https::Proxy "${PROXY_URL}";
+APT_PROXY
+
+mkdir -p /etc/environment.d
+cat > /etc/environment.d/90-optimai-proxy.conf <<ENV_FILE
+http_proxy=${PROXY_URL}
+https_proxy=${PROXY_URL}
+HTTP_PROXY=${PROXY_URL}
+HTTPS_PROXY=${PROXY_URL}
+no_proxy=${NO_PROXY_VALUE}
+NO_PROXY=${NO_PROXY_VALUE}
+ENV_FILE
+
+cat > /etc/profile.d/optimai-proxy.sh <<ENV_SH
+export http_proxy="${PROXY_URL}"
+export https_proxy="${PROXY_URL}"
+export HTTP_PROXY="${PROXY_URL}"
+export HTTPS_PROXY="${PROXY_URL}"
+export no_proxy="${NO_PROXY_VALUE}"
+export NO_PROXY="${NO_PROXY_VALUE}"
+ENV_SH
+chmod 644 /etc/profile.d/optimai-proxy.sh
+
+mkdir -p /etc/systemd/system/docker.service.d
+cat > /etc/systemd/system/docker.service.d/http-proxy.conf <<DOCKER_PROXY
+[Service]
+Environment="HTTP_PROXY=${PROXY_URL}"
+Environment="HTTPS_PROXY=${PROXY_URL}"
+Environment="NO_PROXY=${NO_PROXY_VALUE}"
+DOCKER_PROXY
+
+systemctl daemon-reload >/dev/null 2>&1 || true
+EOF
+    else
+        lxc exec "$container" -- bash -c '
+            rm -f /etc/apt/apt.conf.d/98optimai-proxy
+            rm -f /etc/environment.d/90-optimai-proxy.conf
+            rm -f /etc/profile.d/optimai-proxy.sh
+            rm -f /etc/systemd/system/docker.service.d/http-proxy.conf
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        ' >/dev/null 2>&1 || true
+    fi
+}
+
+container_has_outbound_access() {
+    local container="$1"
+    local proxy_url="${2:-$GLOBAL_PROXY_URL}"
+    local no_proxy_value="${3:-$GLOBAL_NO_PROXY}"
+    [ -z "$container" ] && return 1
+
+    if [ -n "$proxy_url" ]; then
+        lxc exec "$container" -- env \
+            http_proxy="$proxy_url" \
+            https_proxy="$proxy_url" \
+            HTTP_PROXY="$proxy_url" \
+            HTTPS_PROXY="$proxy_url" \
+            no_proxy="$no_proxy_value" \
+            NO_PROXY="$no_proxy_value" \
+            bash -c '
+                if command -v curl >/dev/null 2>&1; then
+                    curl -fsSI --max-time 20 https://download.docker.com >/dev/null 2>&1 ||
+                    curl -fsSI --max-time 20 https://archive.ubuntu.com >/dev/null 2>&1 ||
+                    curl -fsSI --max-time 20 https://security.ubuntu.com >/dev/null 2>&1
+                else
+                    # Без curl считаем сеть потенциально рабочей и продолжаем установку.
+                    exit 0
+                fi
+            ' || lxc exec "$container" -- bash -c '
+                (command -v curl >/dev/null 2>&1 && (
+                    curl -4fsSI --max-time 20 https://download.docker.com >/dev/null 2>&1 ||
+                    curl -4fsSI --max-time 20 https://archive.ubuntu.com >/dev/null 2>&1 ||
+                    curl -4fsSI --max-time 20 https://security.ubuntu.com >/dev/null 2>&1
+                )) ||
+                timeout 8 bash -c "cat < /dev/null > /dev/tcp/1.1.1.1/443" >/dev/null 2>&1
+            '
+    else
+        lxc exec "$container" -- bash -c '
+            ping -4 -c1 -W2 1.1.1.1 >/dev/null 2>&1 ||
+            (command -v curl >/dev/null 2>&1 && (
+                curl -4fsSI --max-time 20 https://download.docker.com >/dev/null 2>&1 ||
+                curl -4fsSI --max-time 20 https://archive.ubuntu.com >/dev/null 2>&1 ||
+                curl -4fsSI --max-time 20 https://security.ubuntu.com >/dev/null 2>&1
+            )) ||
+            timeout 8 bash -c "cat < /dev/null > /dev/tcp/1.1.1.1/443" >/dev/null 2>&1
+        '
+    fi
+}
 
 update_system() {
     echo ""
@@ -78,14 +427,25 @@ install_lxd() {
     echo "=== Проверка/создание сети lxdbr0 ==="
     if ! lxc network show lxdbr0 >/dev/null 2>&1; then
         echo "⚠️ Сеть lxdbr0 отсутствует — создаём..."
-        lxc network create lxdbr0 ipv4.nat=true ipv6.address=none || {
+        create_lxdbr0_network || {
             echo "❌ Не удалось создать сеть lxdbr0"
+            echo "   Попробуйте вручную:"
+            echo "   lxc network create lxdbr0 ipv4.address=10.250.250.1/24 ipv4.nat=true ipv6.address=none"
             read -p "Нажмите Enter..." && return 1
         }
         echo "✅ Сеть lxdbr0 создана"
     else
         echo "✓ Сеть lxdbr0 уже существует"
     fi
+
+    echo "=== Проверка параметров lxdbr0 и host forwarding ==="
+    ensure_host_lxd_docker_modules
+    ensure_host_ipv4_forwarding
+    ensure_lxdbr0_network_health || {
+        echo "❌ lxdbr0 настроен некорректно. Исправьте сеть и повторите пункт 2."
+        read -p "Нажмите Enter..." && return 1
+    }
+    ensure_manual_lxd_nat_rules || true
 
     # Проверка storage pool
     if ! lxc storage show default >/dev/null 2>&1; then
@@ -171,12 +531,17 @@ install_lxd() {
         lxc launch ubuntu:22.04 "$name" || { echo "❌ Ошибка создания $name"; continue; }
 
         # Настройки для запуска Docker внутри (ФИКС синтаксиса)
-        lxc config set "$name" security.privileged true
-        lxc config set "$name" security.nesting true
-		#lxc config set "$name" security.syscalls.intercept.sysctl true   # <- добавляем!
-        lxc config set "$name" security.syscalls.intercept.mknod true
-        #lxc config set "$name" security.syscalls.intercept.setxattr true
-        lxc config set "$name" limits.processes 1000
+        lxc_set_instance_config_safe "$name" "security.privileged" "true" || true
+        lxc_set_instance_config_safe "$name" "security.nesting" "true" || true
+        lxc_set_instance_config_safe "$name" "security.syscalls.intercept.sysctl" "true" || true
+        lxc_set_instance_config_safe "$name" "security.syscalls.intercept.mknod" "true" || true
+        lxc_set_instance_config_safe "$name" "security.syscalls.intercept.setxattr" "true" || true
+        lxc_set_instance_config_safe "$name" "linux.kernel_modules" "overlay,br_netfilter,ip_tables,iptable_nat,xt_conntrack" || true
+        lxc_set_instance_config_safe "$name" "raw.lxc" "lxc.apparmor.profile=unconfined
+lxc.mount.auto=proc:rw sys:rw cgroup:rw
+lxc.cgroup.devices.allow=a
+lxc.cap.drop=" || true
+        lxc_set_instance_config_safe "$name" "limits.processes" "8192" || true
 
         # Привязка сети
         lxc network attach lxdbr0 "$name" eth0 2>/dev/null || true
@@ -196,13 +561,13 @@ install_lxd() {
     echo ""
     echo "=== Проверка интернета (${CONTAINER_PREFIX}1) ==="
     if lxc info "${CONTAINER_PREFIX}1" >/dev/null 2>&1; then
-        if lxc exec "${CONTAINER_PREFIX}1" -- bash -c "ping -c1 -W3 8.8.8.8 >/dev/null 2>&1 || curl -s --max-time 5 http://1.1.1.1 >/dev/null 2>&1"; then
+        load_proxy_settings
+        apply_proxy_settings_to_container "${CONTAINER_PREFIX}1" || true
+        if container_has_outbound_access "${CONTAINER_PREFIX}1"; then
             echo "✅ Интернет работает"
         else
             echo "⚠️ Интернет НЕ работает в ${CONTAINER_PREFIX}1"
-            echo "   Фикс:"
-            echo "   lxc network attach lxdbr0 ${CONTAINER_PREFIX}1 eth0"
-            echo "   lxc restart ${CONTAINER_PREFIX}1"
+            echo "   Проверь прокси/фаервол/NAT и повтори пункт 3."
         fi
     else
         echo "⚠️ Контейнер ${CONTAINER_PREFIX}1 не существует"
@@ -265,84 +630,343 @@ setup_docker() {
     echo "  [3/3] НАСТРОЙКА DOCKER (FIXED)"
     echo "=========================================="
 
-    CONTAINERS=$(lxc list -c n --format csv | grep "^${CONTAINER_PREFIX}")
-    [ -z "$CONTAINERS" ] && { echo "❌ Контейнеры не найдены"; read -p "Enter..."; return; }
+    local max start end result range
+    local existing_containers container_name
+
+    max=$(get_max_container)
+    echo "Какие контейнеры настроить Docker? (5, 1-10, Enter=все 1-$max)"
+    read -r range
+    result=$(parse_range "$range")
+    [ $? -ne 0 ] && { echo "✗ $result"; read -p "Enter..."; return; }
+
+    start=$(echo "$result" | cut -d' ' -f1)
+    end=$(echo "$result" | cut -d' ' -f2)
+
+    existing_containers=$(lxc list -c n --format csv)
+    CONTAINERS=""
+    for i in $(seq "$start" "$end"); do
+        container_name="${CONTAINER_PREFIX}${i}"
+        if echo "$existing_containers" | grep -q "^${container_name}$"; then
+            CONTAINERS="$CONTAINERS $container_name"
+        else
+            echo "⚠️ ${container_name}: контейнер не найден, пропуск"
+        fi
+    done
+    CONTAINERS=$(echo "$CONTAINERS" | xargs)
+    [ -z "$CONTAINERS" ] && { echo "❌ Подходящие контейнеры не найдены"; read -p "Enter..."; return; }
+
+    echo "=== Проверка сети LXD перед установкой Docker ==="
+    ensure_host_lxd_docker_modules
+    ensure_host_ipv4_forwarding
+    ensure_lxdbr0_network_health || {
+        echo "❌ Сеть lxdbr0 не готова. Сначала повтори пункт 2."
+        read -p "Нажми Enter..." && return
+    }
+    ensure_manual_lxd_nat_rules || true
+
+    load_proxy_settings
+    proxy_prompted=0
+    if [ -n "$GLOBAL_PROXY_URL" ]; then
+        echo "✓ Используется сохранённый HTTP(S)-прокси"
+    fi
+
+    configured_count=0
+    failed_count=0
 
     for container in $CONTAINERS; do
         echo ""
         echo "--- $container ---"
 
-        # Проверка: Docker есть и драйвер fuse-overlayfs
-        DOCKER_OK=$(lxc exec $container -- bash -c '
+        desired_kernel_modules="overlay,br_netfilter,ip_tables,iptable_nat,xt_conntrack"
+        desired_raw_lxc="lxc.apparmor.profile=unconfined
+lxc.mount.auto=proc:rw sys:rw cgroup:rw
+lxc.cgroup.devices.allow=a
+lxc.cap.drop="
+        needs_restart=0
+
+        for cfg in \
+            "security.privileged=true" \
+            "security.nesting=true" \
+            "security.syscalls.intercept.mknod=true" \
+            "security.syscalls.intercept.setxattr=true" \
+            "security.syscalls.intercept.sysctl=true"; do
+            key="${cfg%%=*}"
+            val="${cfg#*=}"
+            current="$(lxc config get "$container" "$key" 2>/dev/null || true)"
+            if [ "$current" != "$val" ]; then
+                lxc config set "$container" "$key" "$val" >/dev/null 2>&1 || true
+                needs_restart=1
+            fi
+        done
+
+        current_kernel_modules="$(lxc config get "$container" linux.kernel_modules 2>/dev/null || true)"
+        if [ "$current_kernel_modules" != "$desired_kernel_modules" ]; then
+            lxc config set "$container" linux.kernel_modules "$desired_kernel_modules" >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        current_raw_lxc="$(lxc config get "$container" raw.lxc 2>/dev/null || true)"
+        if [ "$current_raw_lxc" != "$desired_raw_lxc" ]; then
+            lxc config set "$container" raw.lxc "$desired_raw_lxc" >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        proc_limit="$(lxc config get "$container" limits.processes 2>/dev/null || true)"
+        if ! [[ "$proc_limit" =~ ^[0-9]+$ ]] || [ "$proc_limit" -lt 8192 ]; then
+            lxc config set "$container" limits.processes 8192 >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        if [ "$needs_restart" -eq 1 ]; then
+            echo "→ Применены LXD-параметры для Docker, перезапускаем $container..."
+            lxc restart "$container" >/dev/null 2>&1 || true
+            sleep 8
+        fi
+
+        # Проверка: Docker уже установлен и совместимый storage driver активен
+        DOCKER_DRIVER=$(lxc exec "$container" -- bash -c '
             if command -v docker >/dev/null 2>&1; then
                 DRIVER=$(docker info --format "{{.Driver}}" 2>/dev/null || echo "none")
-                [ "$DRIVER" = "fuse-overlayfs" ] && echo "ok"
+                if [ "$DRIVER" = "overlay2" ] || [ "$DRIVER" = "fuse-overlayfs" ] || [ "$DRIVER" = "vfs" ]; then
+                    echo "$DRIVER"
+                fi
             fi
-        ')
+        ' 2>/dev/null || true)
 
-        if [ "$DOCKER_OK" = "ok" ]; then
-            echo "✓ Docker уже установлен и fuse-overlayfs активен, пропускаем"
+        # Важно: пропускаем только overlay2.
+        # Если сейчас fuse-overlayfs/vfs — пытаемся мигрировать на overlay2.
+        if [ "$DOCKER_DRIVER" = "overlay2" ]; then
+            echo "✓ Docker уже установлен (storage-driver: $DOCKER_DRIVER), пропускаем"
+            configured_count=$((configured_count + 1))
             continue
+        elif [ "$DOCKER_DRIVER" = "fuse-overlayfs" ] || [ "$DOCKER_DRIVER" = "vfs" ]; then
+            echo "→ Обнаружен storage-driver: $DOCKER_DRIVER, пробуем миграцию на overlay2"
+        fi
+
+        if ! lxc exec "$container" -- bash -c 'ip -4 route show default | grep -q "^default"'; then
+            echo "⚠️ Нет default route. Перезапускаем контейнер..."
+            lxc restart "$container" >/dev/null 2>&1 || true
+            sleep 8
+        fi
+
+        if ! lxc exec "$container" -- bash -c 'ip -4 route show default | grep -q "^default"'; then
+            echo "❌ В $container нет default route. Запусти пункт 2 и проверь сеть lxdbr0."
+            failed_count=$((failed_count + 1))
+            continue
+        fi
+
+        container_proxy_url="$GLOBAL_PROXY_URL"
+        container_no_proxy="$GLOBAL_NO_PROXY"
+
+        if [ -n "$container_proxy_url" ]; then
+            if ! container_has_outbound_access "$container" "$container_proxy_url" "$container_no_proxy"; then
+                if container_has_outbound_access "$container" "" "$container_no_proxy"; then
+                    echo "⚠️ Сохранённый proxy для $container нестабилен. Используем прямой выход."
+                    container_proxy_url=""
+                fi
+            fi
+        fi
+
+        apply_proxy_settings_to_container "$container" "$container_proxy_url" "$container_no_proxy" || true
+
+        if ! container_has_outbound_access "$container" "$container_proxy_url" "$container_no_proxy"; then
+            echo "⚠️ Нет исходящего трафика в $container. Пробуем восстановить сеть..."
+            ensure_host_ipv4_forwarding
+            ensure_lxdbr0_network_health || true
+            ensure_manual_lxd_nat_rules || true
+            lxc restart "$container" >/dev/null 2>&1 || true
+            sleep 8
+            apply_proxy_settings_to_container "$container" "$container_proxy_url" "$container_no_proxy" || true
+        fi
+
+        if ! container_has_outbound_access "$container" "$container_proxy_url" "$container_no_proxy"; then
+            if [ -z "$container_proxy_url" ] && [ -z "$GLOBAL_PROXY_URL" ] && [ "$proxy_prompted" -eq 0 ]; then
+                proxy_prompted=1
+                if prompt_proxy_settings; then
+                    echo "→ Применяем прокси к контейнерам..."
+                    container_proxy_url="$GLOBAL_PROXY_URL"
+                    container_no_proxy="$GLOBAL_NO_PROXY"
+                    apply_proxy_settings_to_container "$container" "$container_proxy_url" "$container_no_proxy" || true
+                fi
+            fi
+        fi
+
+        if ! container_has_outbound_access "$container" "$container_proxy_url" "$container_no_proxy"; then
+            echo "⚠️ Проверка сети в $container не пройдена, но продолжаем установку (возможен ложный отрицательный результат)."
         fi
 
         echo "⏳ Ждем 5 секунд после запуска контейнера..."
         sleep 5
 
-        lxc exec $container -- bash <<'EOF'
+        if ! lxc exec "$container" -- bash -s -- "$container_proxy_url" "$container_no_proxy" <<'EOF'
 set -e
+PROXY_URL="$1"
+NO_PROXY_VALUE="$2"
 
-echo "[1/6] Проверка nesting..."
+ACTIVE_PROXY_URL="$PROXY_URL"
 
-# [2/6] Установка fuse-overlayfs с retry
-MAX_RETRIES=3
-for attempt in $(seq 1 $MAX_RETRIES); do
-    echo "Попытка $attempt: установка fuse-overlayfs..."
-    if apt-get update -qq && apt-get install -y fuse-overlayfs -qq; then
-        echo "✓ fuse-overlayfs установлен"
-        break
+apply_proxy_profile() {
+    if [ -n "$ACTIVE_PROXY_URL" ]; then
+        export http_proxy="$ACTIVE_PROXY_URL"
+        export https_proxy="$ACTIVE_PROXY_URL"
+        export HTTP_PROXY="$ACTIVE_PROXY_URL"
+        export HTTPS_PROXY="$ACTIVE_PROXY_URL"
+        export no_proxy="$NO_PROXY_VALUE"
+        export NO_PROXY="$NO_PROXY_VALUE"
+
+        cat > /etc/apt/apt.conf.d/98optimai-proxy <<APT_PROXY
+Acquire::http::Proxy "${ACTIVE_PROXY_URL}";
+Acquire::https::Proxy "${ACTIVE_PROXY_URL}";
+APT_PROXY
     else
-        echo "⚠ Попытка $attempt не удалась"
-        if [ "$attempt" -lt "$MAX_RETRIES" ]; then
-            echo "Ждем 5 секунд перед повтором..."
-            sleep 5
-        else
-            echo "❌ fuse-overlayfs не удалось установить после $MAX_RETRIES попыток"
-            exit 1
-        fi
+        unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY no_proxy NO_PROXY
+        rm -f /etc/apt/apt.conf.d/98optimai-proxy
+        rm -f /etc/environment.d/90-optimai-proxy.conf
+        rm -f /etc/profile.d/optimai-proxy.sh
     fi
-done
+}
 
-# [3/6] Настройка daemon.json
+apply_proxy_profile
+
+echo "[1/6] Проверка сетевой связности..."
+if ! ip -4 route show default | grep -q "^default"; then
+    echo "❌ Нет default route внутри контейнера"
+    exit 1
+fi
+if ! (ping -4 -c1 -W3 1.1.1.1 >/dev/null 2>&1 || (command -v curl >/dev/null 2>&1 && curl -fsS --max-time 8 https://download.docker.com >/dev/null 2>&1) || timeout 8 bash -c "cat < /dev/null > /dev/tcp/1.1.1.1/443" >/dev/null 2>&1); then
+    echo "⚠️ Интернет нестабилен, применяем сетевой fallback для APT..."
+fi
+
+echo "[2/6] Подготовка APT (IPv4 + HTTPS)..."
+cat > /etc/apt/apt.conf.d/99optimai-network <<APTCONF
+Acquire::ForceIPv4 "true";
+Acquire::Retries "3";
+Acquire::http::Timeout "20";
+Acquire::https::Timeout "20";
+APTCONF
+
+if [ -f /etc/apt/sources.list ]; then
+    sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g" \
+        /etc/apt/sources.list
+fi
+if ls /etc/apt/sources.list.d/*.list >/dev/null 2>&1; then
+    sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|https://security.ubuntu.com/ubuntu|g" \
+        /etc/apt/sources.list.d/*.list 2>/dev/null || true
+fi
+
+echo "[3/6] Настройка storage-driver (overlay2 preferred)..."
+STORAGE_DRIVER="overlay2"
+if ! grep -qw overlay /proc/filesystems 2>/dev/null; then
+    STORAGE_DRIVER="fuse-overlayfs"
+fi
+
+if [ "$STORAGE_DRIVER" = "fuse-overlayfs" ]; then
+    MAX_RETRIES=3
+    for attempt in $(seq 1 $MAX_RETRIES); do
+        echo "Попытка $attempt: установка fuse-overlayfs..."
+        if apt-get update -qq -o Acquire::ForceIPv4=true && apt-get install -y -qq fuse-overlayfs; then
+            echo "✓ fuse-overlayfs установлен"
+            break
+        else
+            if [ -n "$ACTIVE_PROXY_URL" ]; then
+                echo "⚠ Прокси нестабилен, переключаемся на прямое соединение и повторяем..."
+                ACTIVE_PROXY_URL=""
+                apply_proxy_profile
+                continue
+            fi
+            echo "⚠ Попытка $attempt не удалась"
+            if [ "$attempt" -lt "$MAX_RETRIES" ]; then
+                echo "Ждем 5 секунд перед повтором..."
+                sleep 5
+            fi
+        fi
+    done
+else
+    echo "✓ Будет использован overlay2"
+fi
+
+# [4/6] Настройка daemon.json
 mkdir -p /etc/docker
 cat > /etc/docker/daemon.json <<JSON
 {
-  "storage-driver": "fuse-overlayfs"
+  "storage-driver": "${STORAGE_DRIVER}",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
 }
 JSON
 
-# [4/6] Установка Docker, если нет
+# [5/6] Установка Docker, если нет
 if ! command -v docker >/dev/null 2>&1; then
-    curl -fsSL https://get.docker.com | sh
+    if ! curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 10 https://get.docker.com | sh; then
+        if [ -n "$ACTIVE_PROXY_URL" ]; then
+            echo "⚠ get.docker.com через proxy недоступен, пробуем напрямую..."
+            ACTIVE_PROXY_URL=""
+            apply_proxy_profile
+        fi
+    fi
+
+    if ! command -v docker >/dev/null 2>&1; then
+        if ! curl -fsSL --retry 3 --retry-delay 3 --connect-timeout 10 https://get.docker.com | sh; then
+            echo "⚠ get.docker.com недоступен, пробуем docker.io из apt..."
+            apt-get update -qq -o Acquire::ForceIPv4=true || true
+            apt-get install -y -qq docker.io || {
+                echo "❌ Не удалось установить Docker"
+                exit 1
+            }
+        fi
+    fi
 fi
 
-# [5/6] Запуск Docker
+# [6/6] Запуск Docker
+mkdir -p /etc/systemd/system/docker.service.d
+if [ -n "$ACTIVE_PROXY_URL" ]; then
+    cat > /etc/systemd/system/docker.service.d/http-proxy.conf <<DOCKER_PROXY
+[Service]
+Environment="HTTP_PROXY=${ACTIVE_PROXY_URL}"
+Environment="HTTPS_PROXY=${ACTIVE_PROXY_URL}"
+Environment="NO_PROXY=${NO_PROXY_VALUE}"
+DOCKER_PROXY
+else
+    rm -f /etc/systemd/system/docker.service.d/http-proxy.conf
+fi
+cat > /etc/systemd/system/docker.service.d/optimai-limits.conf <<DOCKER_LIMITS
+[Service]
+TasksMax=infinity
+LimitNOFILE=1048576
+LimitNPROC=1048576
+DOCKER_LIMITS
+systemctl daemon-reload >/dev/null 2>&1 || true
 systemctl enable docker
-systemctl start docker
+systemctl restart docker
 sleep 3
 echo "=== Storage Driver ==="
-docker info | grep "Storage Driver"
+docker info --format "Storage Driver: {{.Driver}}"
 EOF
+        then
+            echo "❌ Ошибка настройки Docker внутри $container"
+            failed_count=$((failed_count + 1))
+            continue
+        fi
 
-        # [6/6] Скачивание образа с retry
+        configured_count=$((configured_count + 1))
+
+        # Скачивание образа с retry
         IMAGE="unclecode/crawl4ai:0.7.3"
         MAX_PULL_RETRIES=3
         for attempt in $(seq 1 $MAX_PULL_RETRIES); do
-            if lxc exec $container -- docker images | grep -q "unclecode/crawl4ai.*0.7.3"; then
+            if lxc exec "$container" -- docker images | grep -q "unclecode/crawl4ai.*0.7.3"; then
                 echo "✓ Образ crawl4ai уже есть"
                 break
             else
                 echo "📦 Попытка $attempt: скачиваем $IMAGE..."
-                if lxc exec $container -- docker pull $IMAGE; then
+                if lxc exec "$container" -- docker pull "$IMAGE"; then
                     echo "✓ Образ скачан"
                     break
                 else
@@ -359,7 +983,7 @@ EOF
     done
 
     echo ""
-    echo "✅ Docker + fuse-overlayfs настроены корректно"
+    echo "✅ Docker настройка завершена: успешно $configured_count, с ошибками $failed_count (driver: overlay2/fuse-overlayfs/vfs)"
     read -p "Нажми Enter..."
 }
 
@@ -561,62 +1185,256 @@ EOF
 # ============================================
 
 start_nodes() {
-local max=$(get_max_container)
-echo "Какие ноды запустить? (например: 5, 1-10 или Enter для всех 1-$max)"
-read -r range
-result=$(parse_range "$range")
-if [ $? -ne 0 ]; then
-echo "✗ $result"
-read -p "Нажми Enter для продолжения..."
-return
-fi
-start=$(echo $result | cut -d' ' -f1)
-end=$(echo $result | cut -d' ' -f2)
-if [ "$start" -eq "$end" ]; then
-echo "Запуск ${CONTAINER_PREFIX}${start}..."
-else
-echo "Запуск нод с ${CONTAINER_PREFIX}${start} по ${CONTAINER_PREFIX}${end}..."
-fi
-for i in $(seq $start $end); do
-echo "[$i] Запуск ${CONTAINER_PREFIX}${i}..."
-lxc exec ${CONTAINER_PREFIX}${i} -- bash << 'SCRIPT'
+    local max=$(get_max_container)
+    echo "Какие ноды запустить? (например: 5, 1-10 или Enter для всех 1-$max)"
+    read -r range
+    result=$(parse_range "$range")
+    if [ $? -ne 0 ]; then
+        echo "✗ $result"
+        read -p "Нажми Enter для продолжения..."
+        return
+    fi
+
+    start=$(echo $result | cut -d' ' -f1)
+    end=$(echo $result | cut -d' ' -f2)
+    total_nodes=$((end - start + 1))
+    inter_node_delay=2
+    if [ "$total_nodes" -gt 10 ]; then
+        inter_node_delay=8
+    fi
+
+    if [ "$start" -eq "$end" ]; then
+        echo "Запуск ${CONTAINER_PREFIX}${start}..."
+    else
+        echo "Запуск нод с ${CONTAINER_PREFIX}${start} по ${CONTAINER_PREFIX}${end}..."
+    fi
+    echo "Интервал запуска между нодами: ${inter_node_delay}с"
+
+    for i in $(seq $start $end); do
+        node_name="${CONTAINER_PREFIX}${i}"
+        echo "[$i] Запуск ${node_name}..."
+        lxc list -c n --format csv | grep -q "^${node_name}$" || { echo "нет"; continue; }
+
+        needs_restart=0
+        desired_kernel_modules="overlay,br_netfilter,ip_tables,iptable_nat,xt_conntrack"
+        desired_raw_lxc="lxc.apparmor.profile=unconfined
+lxc.mount.auto=proc:rw sys:rw cgroup:rw
+lxc.cgroup.devices.allow=a
+lxc.cap.drop="
+        for cfg in \
+            "security.privileged=true" \
+            "security.nesting=true" \
+            "security.syscalls.intercept.mknod=true" \
+            "security.syscalls.intercept.setxattr=true" \
+            "security.syscalls.intercept.sysctl=true"; do
+            key="${cfg%%=*}"
+            val="${cfg#*=}"
+            current="$(lxc config get "$node_name" "$key" 2>/dev/null || true)"
+            if [ "$current" != "$val" ]; then
+                lxc config set "$node_name" "$key" "$val" >/dev/null 2>&1 || true
+                needs_restart=1
+            fi
+        done
+
+        current_kernel_modules="$(lxc config get "$node_name" linux.kernel_modules 2>/dev/null || true)"
+        if [ "$current_kernel_modules" != "$desired_kernel_modules" ]; then
+            lxc config set "$node_name" linux.kernel_modules "$desired_kernel_modules" >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        current_raw_lxc="$(lxc config get "$node_name" raw.lxc 2>/dev/null || true)"
+        if [ "$current_raw_lxc" != "$desired_raw_lxc" ]; then
+            lxc config set "$node_name" raw.lxc "$desired_raw_lxc" >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        proc_limit="$(lxc config get "$node_name" limits.processes 2>/dev/null || true)"
+        if ! [[ "$proc_limit" =~ ^[0-9]+$ ]] || [ "$proc_limit" -lt 8192 ]; then
+            lxc config set "$node_name" limits.processes 8192 >/dev/null 2>&1 || true
+            needs_restart=1
+        fi
+
+        if [ "$needs_restart" -eq 1 ]; then
+            echo "[DEBUG] Применены docker-совместимые параметры LXD, перезапуск ${node_name}..."
+            lxc restart "$node_name" >/dev/null 2>&1 || true
+            sleep 8
+        fi
+
+        if lxc exec "$node_name" -- bash << 'SCRIPT'
+set -e
 mkdir -p /var/log/optimai
-echo "[DEBUG] Остановка старых процессов..."
-pkill -9 -f 'optimai-cli' 2>/dev/null
-sleep 1
+
+echo "[DEBUG] Проверка optimai-cli..."
+if [ ! -x /usr/local/bin/optimai-cli ]; then
+    echo "✗ ОШИБКА: /usr/local/bin/optimai-cli не найден!"
+    exit 1
+fi
+
 echo "[DEBUG] Проверка Docker..."
 if ! systemctl is-active docker >/dev/null 2>&1; then
-echo "[DEBUG] Запуск Docker..."
-systemctl start docker
-sleep 3
+    echo "[DEBUG] Запуск Docker..."
+    systemctl start docker || true
+    sleep 3
 fi
-echo "[DEBUG] Проверка optimai-cli..."
-if [ ! -f /usr/local/bin/optimai-cli ]; then
-echo "✗ ОШИБКА: optimai-cli не найден!"
-exit 1
+
+mkdir -p /etc/systemd/system/docker.service.d
+cat > /etc/systemd/system/docker.service.d/optimai-limits.conf <<DOCKER_LIMITS
+[Service]
+TasksMax=infinity
+LimitNOFILE=1048576
+LimitNPROC=1048576
+DOCKER_LIMITS
+systemctl daemon-reload >/dev/null 2>&1 || true
+
+docker_tasks_max="$(systemctl show docker --property=TasksMax --value 2>/dev/null || true)"
+if [ "$docker_tasks_max" != "infinity" ] && [ "$docker_tasks_max" != "18446744073709551615" ]; then
+    echo "[DEBUG] Применяем лимиты docker.service (TasksMax)..."
+    systemctl restart docker || true
+    sleep 5
 fi
-echo "[DEBUG] Запуск ноды..."
-cd /root
-nohup /usr/local/bin/optimai-cli node start >> /var/log/optimai/node.log 2>&1 &
-sleep 3
-if pgrep -f 'optimai-cli' >/dev/null; then
-PID=$(pgrep -f 'optimai-cli')
-echo "✓ Процесс запущен (PID: $PID)"
+
+if ! timeout 20 docker ps -a >/dev/null 2>&1; then
+    echo "[DEBUG] Docker не отвечает, перезапускаем..."
+    systemctl restart docker || true
+    sleep 5
+fi
+
+if ! timeout 20 docker ps -a >/dev/null 2>&1; then
+    echo "✗ ОШИБКА: Docker не отвечает (docker ps timeout)"
+    systemctl status docker --no-pager -l | tail -40 || true
+    exit 1
+fi
+
+DRIVER=$(docker info --format "{{.Driver}}" 2>/dev/null || echo "unknown")
+if [ "$DRIVER" != "overlay2" ] && grep -qw overlay /proc/filesystems 2>/dev/null; then
+    echo "[DEBUG] Переключаем Docker storage-driver на overlay2..."
+    mkdir -p /etc/docker
+    cat > /etc/docker/daemon.json <<JSON
+{
+  "storage-driver": "overlay2",
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "10m",
+    "max-file": "3"
+  }
+}
+JSON
+    systemctl restart docker || true
+    sleep 5
+    timeout 20 docker ps -a >/dev/null 2>&1 || true
+fi
+
+sysctl -w vm.overcommit_memory=1 >/dev/null 2>&1 || true
+
+echo "[DEBUG] Останавливаем старые процессы optimai-cli (если есть)..."
+pkill -9 -x optimai-cli >/dev/null 2>&1 || true
+sleep 1
+
+echo "[DEBUG] Удаляем старые crawler контейнеры (если есть)..."
+for stale_crawler in $(timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^optimai_crawl4ai(_|$)' || true); do
+    timeout 20 docker rm -f "$stale_crawler" >/dev/null 2>&1 || true
+done
+
+echo "[DEBUG] Настройка systemd сервиса optimai-node..."
+cat > /etc/systemd/system/optimai-node.service <<'UNIT'
+[Unit]
+Description=OptimAI node service
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+StartLimitIntervalSec=600
+StartLimitBurst=6
+
+[Service]
+Type=simple
+WorkingDirectory=/root
+EnvironmentFile=-/etc/environment.d/90-optimai-proxy.conf
+TasksMax=infinity
+LimitNOFILE=1048576
+LimitNPROC=1048576
+ExecStartPre=/bin/bash -lc 'pkill -9 -x optimai-cli >/dev/null 2>&1 || true'
+ExecStartPre=/bin/bash -lc 'timeout 20 docker ps -a >/dev/null 2>&1'
+ExecStartPre=/bin/bash -lc 'for c in $(timeout 20 docker ps -a --format "{{.Names}}" 2>/dev/null | grep -E "^optimai_crawl4ai(_|$)" || true); do timeout 20 docker rm -f "$c" >/dev/null 2>&1 || true; done'
+ExecStart=/usr/local/bin/optimai-cli node start
+Restart=on-failure
+RestartSec=25
+TimeoutStartSec=180
+StandardOutput=append:/var/log/optimai/node.log
+StandardError=append:/var/log/optimai/node.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable optimai-node >/dev/null 2>&1 || true
+systemctl stop optimai-node >/dev/null 2>&1 || true
+systemctl reset-failed optimai-node >/dev/null 2>&1 || true
+systemctl restart optimai-node
+sleep 5
+
+if systemctl is-active optimai-node >/dev/null 2>&1; then
+    echo "✓ optimai-node service запущен"
 else
-echo "✗ Ошибка запуска! Лог:"
-if [ -f /var/log/optimai/node.log ]; then
-tail -20 /var/log/optimai/node.log
-else
-echo "Лог файл не создан"
-fi
-exit 1
+    echo "✗ optimai-node не запустился. Последние логи:"
+    journalctl -u optimai-node -n 40 --no-pager || true
+    echo "----- /var/log/optimai/node.log -----"
+    tail -n 80 /var/log/optimai/node.log 2>/dev/null || echo "node.log пуст или отсутствует"
+    echo "----- docker ps -a -----"
+    timeout 20 docker ps -a || true
+    echo "----- docker logs optimai_crawl4ai* -----"
+    for crawler in $(timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^optimai_crawl4ai(_|$)' || true); do
+        echo ">>> $crawler"
+        timeout 20 docker logs --tail 80 "$crawler" 2>/dev/null || true
+    done
+
+    if tail -n 120 /var/log/optimai/node.log 2>/dev/null | grep -Eqi 'not authenticated|auth login'; then
+        echo "✗ Обнаружена ошибка авторизации OptimAI CLI на этой ноде."
+        echo "  Выполни пункт 5 (Логин OptimAI), затем снова пункт 6 (Запустить ноды)."
+        systemctl stop optimai-node >/dev/null 2>&1 || true
+        systemctl disable optimai-node >/dev/null 2>&1 || true
+        systemctl reset-failed optimai-node >/dev/null 2>&1 || true
+        exit 42
+    fi
+
+    echo "[DEBUG] Пробуем recovery: reset-failed + restart docker + restart optimai-node..."
+    systemctl stop optimai-node >/dev/null 2>&1 || true
+    systemctl reset-failed optimai-node >/dev/null 2>&1 || true
+    for stale_crawler in $(timeout 20 docker ps -a --format '{{.Names}}' 2>/dev/null | grep -E '^optimai_crawl4ai(_|$)' || true); do
+        timeout 20 docker rm -f "$stale_crawler" >/dev/null 2>&1 || true
+    done
+    systemctl restart docker >/dev/null 2>&1 || true
+    sleep 5
+    systemctl restart optimai-node >/dev/null 2>&1 || true
+    sleep 8
+
+    if systemctl is-active optimai-node >/dev/null 2>&1; then
+        echo "✓ optimai-node поднялся после recovery"
+    else
+        echo "✗ optimai-node не поднялся после recovery"
+        journalctl -u optimai-node -n 60 --no-pager || true
+        tail -n 100 /var/log/optimai/node.log 2>/dev/null || true
+        exit 1
+    fi
 fi
 SCRIPT
-echo ""
-sleep 2
-done
-echo "✓ Запуск завершен"
-read -p "Нажми Enter для продолжения..."
+        then
+            echo "✓ ${node_name} запущен"
+        else
+            rc=$?
+            if [ "$rc" -eq 42 ]; then
+                echo "✗ Ошибка запуска ${node_name}: OptimAI CLI не авторизован (сначала пункт 5, потом 6)"
+            else
+                echo "✗ Ошибка запуска ${node_name} (код: $rc)"
+            fi
+        fi
+
+        echo ""
+        sleep "$inter_node_delay"
+    done
+
+    echo "✓ Запуск завершен"
+    read -p "Нажми Enter для продолжения..."
 }
 
 
@@ -629,30 +1447,49 @@ stop_nodes() {
 
     start=$(echo $result | cut -d' ' -f1)
     end=$(echo $result | cut -d' ' -f2)
+    local success_count=0
+    local failed_count=0
 
     for i in $(seq $start $end); do
         echo -n "[$i] ${CONTAINER_PREFIX}${i}: "
         lxc list -c n --format csv | grep -q "^${CONTAINER_PREFIX}${i}$" || { echo "нет"; continue; }
         
-        lxc exec "${CONTAINER_PREFIX}${i}" -- bash -c '
+        if lxc exec "${CONTAINER_PREFIX}${i}" -- bash -c '
+            systemctl stop optimai-node 2>/dev/null || true
+            systemctl disable optimai-node 2>/dev/null || true
+            systemctl reset-failed optimai-node 2>/dev/null || true
+
             echo "Останавливаем Docker контейнеры..."
-            docker stop optimai_crawl4ai_0_7_3 2>/dev/null || true
-            docker rm optimai_crawl4ai_0_7_3 2>/dev/null || true
-            docker system prune -f -q 2>/dev/null || true
+            for stale_crawler in $(timeout 20 docker ps -a --format "{{.Names}}" 2>/dev/null | grep -E "^optimai_crawl4ai(_|$)" || true); do
+                timeout 20 docker stop "$stale_crawler" 2>/dev/null || true
+                timeout 20 docker rm "$stale_crawler" 2>/dev/null || true
+            done
+            timeout 30 docker system prune -f -q 2>/dev/null || true
             
             echo "Останавливаем optimai-cli..."
-            pkill -9 -f "optimai-cli" 2>/dev/null || true
+            # Важно: используем -x, чтобы не убить текущий bash -c по совпадению строки.
+            pkill -9 -x optimai-cli 2>/dev/null || true
             sleep 2
             
             echo "Очистка логов..."
             rm -f /var/log/optimai/node.log
             
             echo "Docker статус: "
-            docker ps -q | wc -l | xargs -I {} echo "{} crawl4ai контейнеров осталось"
+            if timeout 10 docker ps -q >/dev/null 2>&1; then
+                docker ps -q | wc -l | xargs -I {} echo "{} docker контейнеров осталось"
+            else
+                echo "Docker не отвечает"
+            fi
             echo "Лог очищен"
-        '
-        echo "✓ остановлено"
+        '; then
+            echo "✓ остановлено"
+            success_count=$((success_count + 1))
+        else
+            echo "✗ ошибка остановки"
+            failed_count=$((failed_count + 1))
+        fi
     done
+    echo "Итог: остановлено $success_count, ошибок $failed_count"
     read -p "Нажми Enter..."
 }
 
@@ -712,7 +1549,13 @@ check_status() {
     echo "=== СТАТУС НОД ==="
     for i in $(seq 1 $(get_max_container)); do
         if lxc list -c n --format csv | grep -q "^${CONTAINER_PREFIX}${i}$"; then
-            status=$(lxc exec ${CONTAINER_PREFIX}${i} -- pgrep -f "optimai-cli" >/dev/null 2>&1 && echo "РАБОТАЕТ" || echo "ОСТАНОВЛЕНА")
+            status=$(lxc exec ${CONTAINER_PREFIX}${i} -- bash -c '
+                if systemctl list-unit-files | grep -q "^optimai-node.service"; then
+                    systemctl is-active --quiet optimai-node && echo "РАБОТАЕТ" || echo "ОСТАНОВЛЕНА"
+                else
+                    pgrep -f "optimai-cli" >/dev/null 2>&1 && echo "РАБОТАЕТ" || echo "ОСТАНОВЛЕНА"
+                fi
+            ')
             echo "${CONTAINER_PREFIX}${i}: $status"
         fi
     done
@@ -724,6 +1567,7 @@ while true; do
     clear
     echo "=========================================="
     echo " LXD + DOCKER + OPTIMAI MANAGER"
+    echo " Version: ${SCRIPT_VERSION}"
     echo "=========================================="
     echo ""
 
