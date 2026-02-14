@@ -3,7 +3,7 @@ set -e
 
 # Глобальная переменная для префикса контейнеров
 CONTAINER_PREFIX="node"
-SCRIPT_VERSION="2026-02-11.5"
+SCRIPT_VERSION="2026-02-11.6"
 # Файл для хранения учетных данных
 CREDENTIALS_FILE="/root/.optimai_credentials"
 PROXY_SETTINGS_FILE="/root/.optimai_proxy"
@@ -1360,6 +1360,7 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable optimai-node >/dev/null 2>&1 || true
+systemctl reset-failed optimai-node >/dev/null 2>&1 || true
 systemctl restart optimai-node
 sleep 5
 
@@ -1368,7 +1369,30 @@ if systemctl is-active optimai-node >/dev/null 2>&1; then
 else
     echo "✗ optimai-node не запустился. Последние логи:"
     journalctl -u optimai-node -n 40 --no-pager || true
-    exit 1
+    echo "----- /var/log/optimai/node.log -----"
+    tail -n 80 /var/log/optimai/node.log 2>/dev/null || echo "node.log пуст или отсутствует"
+    echo "----- docker ps -a -----"
+    timeout 20 docker ps -a || true
+    echo "----- docker logs optimai_crawl4ai_0_7_3 -----"
+    timeout 20 docker logs --tail 80 optimai_crawl4ai_0_7_3 2>/dev/null || true
+
+    echo "[DEBUG] Пробуем recovery: reset-failed + restart docker + restart optimai-node..."
+    systemctl stop optimai-node >/dev/null 2>&1 || true
+    systemctl reset-failed optimai-node >/dev/null 2>&1 || true
+    timeout 20 docker rm -f optimai_crawl4ai_0_7_3 >/dev/null 2>&1 || true
+    systemctl restart docker >/dev/null 2>&1 || true
+    sleep 5
+    systemctl restart optimai-node >/dev/null 2>&1 || true
+    sleep 8
+
+    if systemctl is-active optimai-node >/dev/null 2>&1; then
+        echo "✓ optimai-node поднялся после recovery"
+    else
+        echo "✗ optimai-node не поднялся после recovery"
+        journalctl -u optimai-node -n 60 --no-pager || true
+        tail -n 100 /var/log/optimai/node.log 2>/dev/null || true
+        exit 1
+    fi
 fi
 SCRIPT
         then
@@ -1406,6 +1430,7 @@ stop_nodes() {
         if lxc exec "${CONTAINER_PREFIX}${i}" -- bash -c '
             systemctl stop optimai-node 2>/dev/null || true
             systemctl disable optimai-node 2>/dev/null || true
+            systemctl reset-failed optimai-node 2>/dev/null || true
 
             echo "Останавливаем Docker контейнеры..."
             timeout 20 docker stop optimai_crawl4ai_0_7_3 2>/dev/null || true
