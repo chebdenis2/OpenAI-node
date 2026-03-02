@@ -3,7 +3,7 @@ set -e
 
 # Глобальная переменная для префикса контейнеров
 CONTAINER_PREFIX="node"
-SCRIPT_VERSION="2026-03-02.7"
+SCRIPT_VERSION="2026-03-02.8"
 # Файл для хранения учетных данных
 CREDENTIALS_FILE="/root/.optimai_credentials"
 PROXY_SETTINGS_FILE="/root/.optimai_proxy"
@@ -1050,11 +1050,44 @@ install_optimai() {
         fi
 
         echo "устанавливаю..."
-        lxc exec ${CONTAINER_PREFIX}${i} -- bash -c "
-            curl -L https://optimai.network/download/cli-node/linux -o /tmp/optimai-cli &&
-            chmod +x /tmp/optimai-cli &&
-            mv /tmp/optimai-cli /usr/local/bin/optimai-cli
-        "
+        if lxc exec "${CONTAINER_PREFIX}${i}" -- bash -s <<'EOF'
+set -e
+
+CLI_PATH="/usr/local/bin/optimai-cli"
+TMP_CLI="/tmp/optimai-cli.$$"
+MAX_RETRIES=4
+download_ok=0
+
+for cli_url in "https://cli-node.optimai.network/optimai_cli_ubuntu" "https://optimai.network/download/cli-node/linux"; do
+    for attempt in $(seq 1 "$MAX_RETRIES"); do
+        if curl -fsSL --connect-timeout 20 --max-time 180 --retry 2 --retry-delay 2 "$cli_url" -o "$TMP_CLI"; then
+            download_ok=1
+            break 2
+        fi
+        sleep 2
+    done
+done
+
+if [ "$download_ok" -ne 1 ] || [ ! -s "$TMP_CLI" ]; then
+    echo "❌ не удалось скачать OptimAI CLI"
+    exit 1
+fi
+
+chmod +x "$TMP_CLI"
+install -m 0755 "$TMP_CLI" "$CLI_PATH"
+rm -f "$TMP_CLI"
+
+# Важно: сбрасываем только кеш core/wrapper (логин не трогаем),
+# чтобы CLI принудительно скачал свежий core даже при том же version string.
+mkdir -p /root/.optimai
+rm -f /root/.optimai/optimai_cli_core /root/.optimai/optimai_cli_core.version /root/.optimai/optimai_cli_wrapper.version
+timeout 120 "$CLI_PATH" --version >/dev/null 2>&1 || true
+EOF
+        then
+            echo "OK"
+        else
+            echo "ошибка установки"
+        fi
     done
     echo ""
     echo "Установка завершена"
@@ -1084,7 +1117,8 @@ update_optimai() {
         if lxc exec "${CONTAINER_PREFIX}${i}" -- bash -s <<'EOF'
 set -e
 
-CLI_URL="https://optimai.network/download/cli-node/linux"
+CLI_PRIMARY_URL="https://cli-node.optimai.network/optimai_cli_ubuntu"
+CLI_FALLBACK_URL="https://optimai.network/download/cli-node/linux"
 CLI_PATH="/usr/local/bin/optimai-cli"
 TMP_CLI="/tmp/optimai-cli.$$"
 MAX_RETRIES=5
@@ -1098,15 +1132,17 @@ if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null
     systemctl reset-failed optimai-node >/dev/null 2>&1 || true
 fi
 
-old_version="$($CLI_PATH --version 2>/dev/null || echo "not-installed")"
+old_version="$($CLI_PATH --version 2>/dev/null | sed -n '1p' || echo "not-installed")"
 
 download_ok=0
-for attempt in $(seq 1 "$MAX_RETRIES"); do
-    if curl -fsSL --connect-timeout 20 --max-time 180 --retry 2 --retry-delay 2 "$CLI_URL" -o "$TMP_CLI"; then
-        download_ok=1
-        break
-    fi
-    sleep 2
+for cli_url in "$CLI_PRIMARY_URL" "$CLI_FALLBACK_URL"; do
+    for attempt in $(seq 1 "$MAX_RETRIES"); do
+        if curl -fsSL --connect-timeout 20 --max-time 180 --retry 2 --retry-delay 2 "$cli_url" -o "$TMP_CLI"; then
+            download_ok=1
+            break 2
+        fi
+        sleep 2
+    done
 done
 
 if [ "$download_ok" -ne 1 ] || [ ! -s "$TMP_CLI" ]; then
@@ -1118,7 +1154,16 @@ chmod +x "$TMP_CLI"
 install -m 0755 "$TMP_CLI" "$CLI_PATH"
 rm -f "$TMP_CLI"
 
-new_version="$($CLI_PATH --version 2>/dev/null || echo "unknown")"
+# Важно: сбрасываем только кеш core/wrapper, не трогая auth/login.
+mkdir -p /root/.optimai
+rm -f /root/.optimai/optimai_cli_core /root/.optimai/optimai_cli_core.version /root/.optimai/optimai_cli_wrapper.version
+
+refresh_log="/tmp/optimai-cli-refresh.$$"
+timeout 120 "$CLI_PATH" --version >"$refresh_log" 2>&1 || true
+new_version="$(sed -n '1p' "$refresh_log")"
+[ -z "$new_version" ] && new_version="$($CLI_PATH --version 2>/dev/null | sed -n '1p' || echo "unknown")"
+rm -f "$refresh_log"
+
 echo "версии: $old_version -> $new_version"
 
 if [ "$was_active" -eq 1 ]; then
@@ -1450,6 +1495,48 @@ else
         exit 42
     fi
 
+    if tail -n 120 /var/log/optimai/node.log 2>/dev/null | grep -Eqi 'newer OptimAI CLI version is required|update/re-install OptimAI CLI'; then
+        echo "[DEBUG] Обнаружено требование обновления CLI, выполняем авто-refresh..."
+        CLI_PATH="/usr/local/bin/optimai-cli"
+        TMP_CLI="/tmp/optimai-cli-refresh.$$"
+        download_ok=0
+
+        for cli_url in "https://cli-node.optimai.network/optimai_cli_ubuntu" "https://optimai.network/download/cli-node/linux"; do
+            for attempt in 1 2 3 4; do
+                if curl -fsSL --connect-timeout 20 --max-time 180 --retry 2 --retry-delay 2 "$cli_url" -o "$TMP_CLI"; then
+                    download_ok=1
+                    break 2
+                fi
+                sleep 2
+            done
+        done
+
+        if [ "$download_ok" -eq 1 ] && [ -s "$TMP_CLI" ]; then
+            chmod +x "$TMP_CLI"
+            install -m 0755 "$TMP_CLI" "$CLI_PATH"
+            rm -f "$TMP_CLI"
+            mkdir -p /root/.optimai
+            rm -f /root/.optimai/optimai_cli_core /root/.optimai/optimai_cli_core.version /root/.optimai/optimai_cli_wrapper.version
+            timeout 120 "$CLI_PATH" --version >/dev/null 2>&1 || true
+
+            systemctl stop optimai-node >/dev/null 2>&1 || true
+            systemctl reset-failed optimai-node >/dev/null 2>&1 || true
+            systemctl restart optimai-node >/dev/null 2>&1 || true
+            sleep 10
+            if systemctl is-active optimai-node >/dev/null 2>&1; then
+                echo "✓ optimai-node поднялся после авто-refresh CLI"
+                exit 0
+            fi
+        fi
+
+        echo "✗ Требуемое обновление OptimAI CLI не применилось автоматически."
+        echo "  Выполни пункт 11, затем снова пункт 6."
+        systemctl stop optimai-node >/dev/null 2>&1 || true
+        systemctl disable optimai-node >/dev/null 2>&1 || true
+        systemctl reset-failed optimai-node >/dev/null 2>&1 || true
+        exit 43
+    fi
+
     echo "[DEBUG] Пробуем recovery: reset-failed + restart docker + restart optimai-node..."
     systemctl stop optimai-node >/dev/null 2>&1 || true
     systemctl reset-failed optimai-node >/dev/null 2>&1 || true
@@ -1477,6 +1564,8 @@ SCRIPT
             rc=$?
             if [ "$rc" -eq 42 ]; then
                 echo "✗ Ошибка запуска ${node_name}: OptimAI CLI не авторизован (сначала пункт 5, потом 6)"
+            elif [ "$rc" -eq 43 ]; then
+                echo "✗ Ошибка запуска ${node_name}: CLI требует более свежий core (выполни пункт 11 и повтори пункт 6)"
             else
                 echo "✗ Ошибка запуска ${node_name} (код: $rc)"
             fi
