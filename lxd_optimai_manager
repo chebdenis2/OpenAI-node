@@ -3,7 +3,7 @@ set -e
 
 # Глобальная переменная для префикса контейнеров
 CONTAINER_PREFIX="node"
-SCRIPT_VERSION="2026-03-02.8"
+SCRIPT_VERSION="2026-03-02.9"
 # Файл для хранения учетных данных
 CREDENTIALS_FILE="/root/.optimai_credentials"
 PROXY_SETTINGS_FILE="/root/.optimai_proxy"
@@ -1230,17 +1230,17 @@ login_optimai() {
             [ -f /usr/local/bin/optimai-cli ] || { echo 'CLI не установлен'; exit 1; }
             command -v expect >/dev/null || { apt-get update -qq && apt-get install -y expect -qq >/dev/null; }
             expect <<'EOF'
-set timeout 60
-spawn /usr/local/bin/optimai-cli auth login
+set timeout 90
+spawn /usr/local/bin/optimai-cli auth login --legacy
 expect {
     \"Already logged in\" {
         puts \"✓ Уже залогинен\"
         exit 0
     }
-    \"Email:\" {
+    -re \"(Email|E-mail):\" {
         sleep 1
         send \"$OPTIMAI_LOGIN\r\"
-        expect \"Password:\" {
+        expect -re \"Password:\" {
             sleep 2
             send \"$OPTIMAI_PASSWORD\r\"
             expect {
@@ -1248,8 +1248,16 @@ expect {
                     puts \"✓ Успешный вход\"
                     exit 0
                 }
+                -re \"(Successfully|Logged in|Login successful)\" {
+                    puts \"✓ Успешный вход\"
+                    exit 0
+                }
                 \"Invalid\" {
                     puts \"✗ Неверный логин или пароль\"
+                    exit 1
+                }
+                -re \"(Starting browser login|Open this URL|node\\.optimai\\.network/login)\" {
+                    puts \"✗ CLI запустил browser-login вместо legacy. Проверь версию CLI и повтори пункт 11.\"
                     exit 1
                 }
                 timeout {
