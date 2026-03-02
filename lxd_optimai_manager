@@ -3,7 +3,7 @@ set -e
 
 # Глобальная переменная для префикса контейнеров
 CONTAINER_PREFIX="node"
-SCRIPT_VERSION="2026-02-11.6"
+SCRIPT_VERSION="2026-03-02.7"
 # Файл для хранения учетных данных
 CREDENTIALS_FILE="/root/.optimai_credentials"
 PROXY_SETTINGS_FILE="/root/.optimai_proxy"
@@ -1064,7 +1064,7 @@ install_optimai() {
 update_optimai() {
     echo ""
     echo "=========================================="
-    echo " ОБНОВЛЕНИЕ OPTIMAI CLI"
+    echo " ПРИНУДИТЕЛЬНОЕ ОБНОВЛЕНИЕ OPTIMAI CLI"
     echo "=========================================="
     local max=$(get_max_container)
     echo "Где обновить? (5, 1-10, Enter=все)"
@@ -1074,14 +1074,67 @@ update_optimai() {
 
     start=$(echo $result | cut -d' ' -f1)
     end=$(echo $result | cut -d' ' -f2)
+    local success_count=0
+    local failed_count=0
 
     for i in $(seq $start $end); do
         echo -n "[$i] ${CONTAINER_PREFIX}${i}: "
         lxc list -c n --format csv | grep -q "^${CONTAINER_PREFIX}${i}$" || { echo "нет"; continue; }
-        lxc exec ${CONTAINER_PREFIX}${i} -- /usr/local/bin/optimai-cli update 2>/dev/null && echo "OK" || echo "ошибка"
+
+        if lxc exec "${CONTAINER_PREFIX}${i}" -- bash -s <<'EOF'
+set -e
+
+CLI_URL="https://optimai.network/download/cli-node/linux"
+CLI_PATH="/usr/local/bin/optimai-cli"
+TMP_CLI="/tmp/optimai-cli.$$"
+MAX_RETRIES=5
+
+was_active=0
+if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files 2>/dev/null | grep -q '^optimai-node.service'; then
+    if systemctl is-active --quiet optimai-node; then
+        was_active=1
+    fi
+    systemctl stop optimai-node >/dev/null 2>&1 || true
+    systemctl reset-failed optimai-node >/dev/null 2>&1 || true
+fi
+
+old_version="$($CLI_PATH --version 2>/dev/null || echo "not-installed")"
+
+download_ok=0
+for attempt in $(seq 1 "$MAX_RETRIES"); do
+    if curl -fsSL --connect-timeout 20 --max-time 180 --retry 2 --retry-delay 2 "$CLI_URL" -o "$TMP_CLI"; then
+        download_ok=1
+        break
+    fi
+    sleep 2
+done
+
+if [ "$download_ok" -ne 1 ] || [ ! -s "$TMP_CLI" ]; then
+    echo "❌ download failed"
+    exit 1
+fi
+
+chmod +x "$TMP_CLI"
+install -m 0755 "$TMP_CLI" "$CLI_PATH"
+rm -f "$TMP_CLI"
+
+new_version="$($CLI_PATH --version 2>/dev/null || echo "unknown")"
+echo "версии: $old_version -> $new_version"
+
+if [ "$was_active" -eq 1 ]; then
+    systemctl restart optimai-node >/dev/null 2>&1 || true
+fi
+EOF
+        then
+            echo "OK"
+            success_count=$((success_count + 1))
+        else
+            echo "ошибка"
+            failed_count=$((failed_count + 1))
+        fi
     done
     echo ""
-    echo "Обновление завершено"
+    echo "Обновление завершено: успешно $success_count, ошибок $failed_count"
     read -p "Нажми Enter..."
 }
 
@@ -1588,7 +1641,7 @@ while true; do
 
     echo "=== ДОПОЛНИТЕЛЬНО ==="
     echo "10) Настройка SWAP файла"
-    echo "11) Обновление OptimAI CLI"
+    echo "11) Принудительное обновление OptimAI CLI"
     echo "12) Удалить все контейнеры LXD"
     echo "13) Выход"
     echo "=========================================="
